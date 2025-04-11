@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dados Salvos</title>
+    <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        .container {
+            margin-top: 20px;
+        }
+        .data-container {
+            margin-bottom: 20px;
+            padding: 20px;
+            background-color: #f9f9f9;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        .image-container img {
+            max-width: 100%;
+            height: auto;
+        }
+        .back-button {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            background-color: #007bff;
+            color: white;
+            padding: 10px 20px;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .back-button:hover {
+            background-color: #0056b3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1 class="mb-4">Dados Salvos</h1>
+
+        <div class="data-container">
+            <h4>Informações do Usuário</h4>
+            <p><strong>Nome:</strong> {{ dados_salvos.username }}</p>
+            <p><strong>Email:</strong> {{ dados_salvos.email }}</p>
+            <p><strong>Ambiente de Propagação:</strong> {{ dados_salvos.propagation_model }}</p>
+            <p><strong>Frequência:</strong> {{ dados_salvos.frequencia }} MHz</p>
+            <p><strong>Altura da Torre:</strong> {{ dados_salvos.tower_height }} m</p>
+            <p><strong>Altura do Receptor:</strong> {{ dados_salvos.rx_height }} m</p>
+            <p><strong>Total de Perdas no Sistema:</strong> {{ dados_salvos.total_loss }} dB</p>
+            <p><strong>Potência de Transmissão:</strong> {{ dados_salvos.transmission_power }} W</p>
+            <p><strong>Ganho da Antena:</strong> {{ dados_salvos.antenna_gain }} dBi</p>
+            <p><strong>Ganho do Receptor:</strong> {{ dados_salvos.rx_gain }} dB</p>
+            <p><strong>Direção da Antena:</strong> {{ dados_salvos.antenna_direction }} graus</p>
+            <p><strong>Tilt da Antena:</strong> {{ dados_salvos.antenna_tilt }} graus</p>
+            <p><strong>Latitude:</strong> {{ dados_salvos.latitude }}</p>
+            <p><strong>Longitude:</strong> {{ dados_salvos.longitude }}</p>
+            <p><strong>Serviço:</strong> {{ dados_salvos.servico }}</p>
+            <p><strong>Notas:</strong> {{ dados_salvos.notes }}</p>
+        </div>
+
+        {% if image_data.perfil_img %}
+        <div class="data-container image-container">
+            <h4>Imagem do Perfil de Elevação</h4>
+            <img src="data:image/png;base64,{{ image_data.perfil_img }}" alt="Perfil de Elevação">
+        </div>
+        {% endif %}
+
+        {% if image_data.cobertura_img %}
+        <div class="data-container image-container">
+            <h4>Imagem da Cobertura</h4>
+            <img src="data:image/png;base64,{{ image_data.cobertura_img }}" alt="Cobertura">
+        </div>
+        {% endif %}
+
+        {% if image_data.antenna_pattern_img_dia_H %}
+        <div class="data-container image-container">
+            <h4>Diagrama de Radiação Horizontal</h4>
+            <img src="data:image/png;base64,{{ image_data.antenna_pattern_img_dia_H }}" alt="Diagrama Horizontal">
+        </div>
+        {% endif %}
+
+        {% if image_data.antenna_pattern_img_dia_V %}
+        <div class="data-container image-container">
+            <h4>Diagrama de Radiação Vertical</h4>
+            <img src="data:image/png;base64,{{ image_data.antenna_pattern_img_dia_V }}" alt="Diagrama Vertical">
+        </div>
+        {% endif %}
+    </div>
+
+    <button class="back-button" onclick="window.location.href='/home'">Voltar</button>
+
+    <!-- Bootstrap Bundle with Popper -->
+    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.0.6/dist/umd/popper.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+</body>
+</html>

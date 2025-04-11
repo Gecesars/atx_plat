@@ -1,0 +1,114 @@
+    def generate_signal_level_image(lons, lats, _total_atten, radius_km, lon_center, lat_center, Ptx_W, g_total, min_val, max_val, loss):
+        user_id = current_user.id
+        user = User.query.get(user_id)
+        direction = user.antenna_direction
+        ganho = user.antenna_gain
+
+        if user.antenna_pattern:
+            file_content = user.antenna_pattern.decode('latin1')
+            parts = file_content.split('999')
+            horizontal_lines = parts[0].splitlines()[1:361]
+            horizontal_data = np.array([float(line.split(',')[1].strip()) for line in horizontal_lines if line.strip()])
+
+            lon_center = lon_center.to(u.deg).value if hasattr(lon_center, 'unit') else lon_center
+            lat_center = lat_center.to(u.deg).value if hasattr(lat_center, 'unit') else lat_center
+
+            lon_grid, lat_grid = np.meshgrid(lons, lats)
+            azimutes_grid = np.degrees(np.arctan2(lon_grid - lon_center, lat_grid - lat_center)) % 360  # Ajuste aqui
+            azimutes_indices = np.round(azimutes_grid).astype(int)
+            azimutes_indices = np.where(azimutes_indices == 360, 0, azimutes_indices)
+
+            if direction is not None:
+                rotation_index = int((direction) / (360 / len(horizontal_data)))  # Ajuste aqui para direção
+                horizontal_data = np.roll(horizontal_data, rotation_index)
+
+            antenna_gain_grid = horizontal_data[azimutes_indices] * u.dB
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+
+        P_dBm = 10 * math.log10(Ptx_W / 0.001)
+        P_tx_dBm = P_dBm * (u.dB(u.mW))
+        ganho = ganho * (u.dB)
+        signal_levels = P_tx_dBm.value + ganho.value + antenna_gain_grid.value - loss - _total_atten.to(u.dB).value
+
+       # print('ganho: ', antenna_gain_grid, 'direção: ', direction)
+
+        if min_val is None or max_val is None:
+            min_val = -80
+            max_val = -20
+
+        try:
+            min_val = float(min_val) if min_val is not None else np.nanmin(signal_levels)
+            max_val = float(max_val) if max_val is not None else np.nanmax(signal_levels)
+        except ValueError:
+            raise ValueError("Os valores de mínimo e máximo devem ser numéricos.")
+
+        if min_val >= max_val:
+            raise ValueError("O valor mínimo deve ser menor que o valor máximo.")
+
+        lon_center = lon_center.to(u.deg).value if isinstance(lon_center, u.Quantity) else lon_center
+        lat_center = lat_center.to(u.deg).value if isinstance(lat_center, u.Quantity) else lat_center
+
+        dados = _total_atten.shape[0]
+        delta = radius_km / 111
+        lon_grid, lat_grid = np.meshgrid(
+            np.linspace(lon_center - delta, lon_center + delta, num=dados),
+            np.linspace(lat_center - delta, lat_center + delta, num=dados)
+        )
+
+        dist = np.sqrt((lon_grid - lon_center) ** 2 + (lat_grid - lat_center) ** 2)
+        earth_radius_km = 6371.0
+        dist_km = dist * (np.pi / 180) * earth_radius_km
+        signal_levels[dist_km > radius_km] = np.nan
+
+        levels = np.linspace(min_val, max_val, 100)
+        mesh = ax.pcolormesh(lon_grid, lat_grid, signal_levels, cmap='rainbow', shading='auto', vmin=min_val, vmax=max_val)
+
+        polar_dimension = min(fig.get_size_inches()) * radius_km / (radius_km * 20)
+        ax_inset = fig.add_axes([(1.034 - polar_dimension) / 2,
+                                (1 - polar_dimension) / 2,
+                                polar_dimension, polar_dimension], polar=True)
+
+        ax_inset.set_theta_zero_location('N')
+        ax_inset.set_theta_direction(-1)
+
+        ax_inset.set_aspect('equal', adjustable='box')
+        azimutes = np.linspace(0, 2 * np.pi, len(horizontal_data))
+        ax_inset.plot(azimutes, horizontal_data, linestyle='dashed', color='black', label='Antenna Pattern')
+
+        # Adição dos valores dos ganhos de 15 em 15 graus
+        for i in range(0, 360, 15):
+            angle = np.radians(i)
+            radius = horizontal_data[i]
+            ax_inset.text(angle, radius + 1, f'{radius:.1f}', fontsize=8, ha='center', va='center', color='blue')
+
+        ax_inset.set_xticks([])
+        ax_inset.set_yticks([])
+        ax_inset.spines['polar'].set_visible(False)
+
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.xaxis.label.set_visible(False)
+        ax.yaxis.label.set_visible(False)
+
+        img_buffer = io.BytesIO()
+        plt.savefig(img_buffer, format='png', transparent=True)
+        img_buffer.seek(0)
+        image_base64 = base64.b64encode(img_buffer.read()).decode('utf-8')
+        plt.close(fig)
+
+        fig_colorbar, ax_colorbar = plt.subplots(figsize=(6, 1))
+        plt.colorbar(mesh, cax=ax_colorbar, orientation='horizontal')
+        ax_colorbar.set_title('Nível de Sinal [dBm]')
+        ax_colorbar.margins(0.1)
+        fig_colorbar.tight_layout()
+        colorbar_buffer = io.BytesIO()
+        fig_colorbar.savefig(colorbar_buffer, format='png', transparent=True)
+        colorbar_buffer.seek(0)
+        colorbar_base64 = base64.b64encode(colorbar_buffer.read()).decode('utf-8')
+        plt.close(fig_colorbar)
+
+        return image_base64, colorbar_base64

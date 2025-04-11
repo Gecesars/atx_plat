@@ -1,0 +1,193 @@
+def generate_signal_level_image(lons, lats, _total_atten, radius_km, lon_center, lat_center, Ptx_W, G_tx_dBi,min_val,max_val,loss):
+        user_id = current_user.id  # Asumindo que você está usando Flask-Login ou um sistema similar
+        user = User.query.get(user_id)
+        direction = user.antenna_direction
+        #tilt = user.antenna_tilt
+        if user.antenna_pattern:
+            file_content = user.antenna_pattern.decode('latin1')
+            parts = file_content.split('999')
+            horizontal_lines = parts[0].splitlines()[1:361]
+            horizontal_data = np.array([float(line.split(',')[1].strip()) for line in horizontal_lines if line.strip()])
+            #azimutes = np.arange(360)
+            # Convertendo lon_center e lat_center para valores numéricos puros, caso estejam com unidades
+            lon_center = lon_center.to(u.deg).value if hasattr(lon_center, 'unit') else lon_center
+            lat_center = lat_center.to(u.deg).value if hasattr(lat_center, 'unit') else lat_center
+                # Cálculo do grid de azimutes
+
+            # Cálculo do grid de azimutes
+            lon_grid, lat_grid = np.meshgrid(lons, lats)
+            azimutes_grid = np.degrees(np.arctan2(lat_grid - lat_center, lon_grid - lon_center)) % 360
+            azimutes_indices = np.round(azimutes_grid).astype(int)
+            azimutes_indices = np.where(azimutes_indices == 360, 0, azimutes_indices)  # Corrige índice 360 para 0
+
+            antenna_gain_grid = horizontal_data[azimutes_indices] * u.dB
+
+            # Cálculo do grid de azimutes
+            print(antenna_gain_grid)
+
+
+        # Rotacionar os dados se a direção for especificada
+        if direction is not None:
+            rotation_index = int(direction / (360 / len(horizontal_data)))
+            horizontal_data = np.roll(horizontal_data, -rotation_index)
+            antenna_gain_grid = horizontal_data[azimutes_indices] * u.dB
+
+        #fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 6))
+
+        
+
+           
+
+        fig, ax = plt.subplots()
+
+
+
+        
+
+            # Cálculo do grid de azimutes
+        # lon_grid, lat_grid = np.meshgrid(lons, lats)
+        # azimutes_grid = np.degrees(np.arctan2(lat_grid - lat_center, lon_grid - lon_center)) % 360
+        # azimutes_indices = np.round(azimutes_grid).astype(int)
+        # antenna_gain_grid = antenna_gains[azimutes_indices]
+
+        P_dBm = 10 * math.log10(Ptx_W / 0.001)  # Dividindo por 0.001 converte watts para miliwatts
+        # Conversão de potência de transmissão e ganho de antena para dB
+        P_tx_dBm = P_dBm*(u.dB(u.mW))
+        #G_tx_dBi = G_tx_dBi*(u.dB)
+
+       # Cálculo do nível de sinal
+       
+        signal_levels = P_tx_dBm.value + antenna_gain_grid.value - loss - _total_atten.to(u.dB).value
+        print(P_tx_dBm)
+        print(G_tx_dBi)
+
+      # Criando um meshgrid com as coordenadas
+      #  lon_grid, lat_grid = np.meshgrid(lons, lats)
+        if min_val == None or max_val == None:
+           min_val = -80
+           max_val = -20
+
+        try:
+            min_val = float(min_val) if min_val is not None else np.nanmin(signal_levels)
+            max_val = float(max_val) if max_val is not None else np.nanmax(signal_levels)
+        except ValueError:
+            raise ValueError("Os valores de mínimo e máximo devem ser numéricos.")
+
+        # Verificação lógica para garantir que min_val é menor que max_val
+        if min_val >= max_val:
+            raise ValueError("O valor mínimo deve ser menor que o valor máximo.")
+
+        
+        # Conversão de unidades para valores escalares, se necessário
+        lon_center = lon_center.to(u.deg).value if isinstance(lon_center, u.Quantity) else lon_center
+        lat_center = lat_center.to(u.deg).value if isinstance(lat_center, u.Quantity) else lat_center
+
+        dados = _total_atten.shape[0]
+        print(dados)
+        # Ajustando o meshgrid para estar centrado no RX
+        delta = radius_km / 111  # Aproximadamente quantos graus corresponde ao raio em km
+        lon_grid, lat_grid = np.meshgrid(
+            np.linspace(lon_center - delta, lon_center + delta, num=dados),
+            np.linspace(lat_center - delta, lat_center + delta, num=dados)
+        )
+
+        # Calculando distâncias de cada ponto no grid ao centro em graus
+        #dist = np.sqrt((lon_grid - lon_center.to(u.deg).value)**2 + (lat_grid - lat_center.to(u.deg).value)**2)
+        dist = np.sqrt((lon_grid - lon_center)**2 + (lat_grid - lat_center)**2)
+
+            # Conversão da distância de graus para quilômetros
+        earth_radius_km = 6371.0
+        dist_km = dist * (np.pi/180) * earth_radius_km
+         # Aplicar a máscara para distâncias maiores que o raio
+        signal_levels[dist_km > radius_km] = np.nan  # Atribuindo NaN para valores fora do círculo
+        # Configurando os níveis do gráfico baseados nos valores mínimos e máximos fornecidos
+        # if isinstance(min_val, list):
+        #    min_val = min_val[0] if min_val else None
+        # if isinstance(max_val, list):
+        #    max_val = max_val[0] if max_val else None
+
+        # Conversão e validação dos valores de entrada
+        
+
+
+        levels = np.linspace(min_val, max_val, 100)
+        # Uso de pcolormesh para uma abordagem mais robusta
+        mesh = ax.pcolormesh(lon_grid, lat_grid, signal_levels, cmap='rainbow', shading='auto', vmin=min_val, vmax=max_val)
+
+                # Criar gráfico polar para o diagrama da antena sobreposto
+        # Centralizando o gráfico polar sobre a área de cobertura
+        fig_width, fig_height = fig.get_size_inches()
+        polar_width, polar_height = 0.3 * fig_width, 0.3 * fig_height  # ajuste o tamanho conforme necessário
+        ax_inset = fig.add_axes([(fig_width - polar_width) / 2 / fig_width,
+                                (fig_height - polar_height) / 2 / fig_height,
+                                0.3, 0.3], aspect='equal', polar=True)
+
+        azimutes = np.linspace(0, 2 * np.pi, len(horizontal_data))
+        # Configurando o aspecto do eixo para ser igual
+        ax_inset.set_aspect('equal', adjustable='box')
+        ax_inset.plot(azimutes, horizontal_data, label='Antenna Pattern')
+
+        # Definindo os níveis para o gráfico de contornos
+       # levels = np.linspace(np.nanmin(signal_levels), np.nanmax(signal_levels), 100)
+       # cim = ax.contourf(lon_grid, lat_grid, signal_levels, levels=levels, cmap='rainbow')
+
+         # Adicionar barra de cores
+        # cax = fig.add_axes([0.05, 0.05, 0.9, 0.05])  # ajustar essas proporções conforme necessário
+        # cbar = plt.colorbar(mesh, cax=cax, orientation='horizontal')
+        # cbar.set_label('Nível de Sinal [dBm]')
+
+        # Adicionar círculo de cobertura
+        earth_radius_km = 6371.0
+        radius_degrees_lat = radius_km / (earth_radius_km * (np.pi/180))
+        radius_degrees_lon = radius_km / (earth_radius_km * np.cos(np.radians(lat_center*u.deg)) * (np.pi/180))
+
+        # circle = plt.Circle((lon_center.to(u.deg).value, lat_center.to(u.deg).value),
+        #                    max(radius_degrees_lon, radius_degrees_lat),
+        #                    color='red', fill=False, linestyle='--')
+        # ax.add_artist(circle)
+       # ax.set_aspect('equal', adjustable='box')
+        #plt.axis('off')  # Desativa os eixos para uma visualização limpa
+        # Salvar a figura em um buffer
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+        # Desativar os eixos e rótulos
+        ax.set_xticks([])
+        ax.set_yticks([])
+        ax.xaxis.label.set_visible(False)
+        ax.yaxis.label.set_visible(False)
+
+        # img_buffer = io.BytesIO()
+        # plt.savefig(img_buffer, format='png', transparent=True)
+        # img_buffer.seek(0)
+        # plt.close(fig)
+
+       # Geração da colorbar em uma nova figura
+        # fig_colorbar, ax_colorbar = plt.subplots(figsize=(6, 1))
+        # cbar = plt.colorbar(mesh, cax=ax_colorbar, orientation='horizontal')
+        # ax_colorbar.set_title('Nível de Sinal [dBm]')
+
+       # Salvar a imagem da mancha
+        img_buffer = io.BytesIO()
+        plt.savefig(img_buffer, format='png', transparent=True)
+        img_buffer.seek(0)
+        image_base64 = base64.b64encode(img_buffer.read()).decode('utf-8')
+        plt.close(fig)
+       
+        
+
+        # Criação da colorbar em uma nova figura
+        fig_colorbar, ax_colorbar = plt.subplots(figsize=(6, 1))
+        plt.colorbar(mesh, cax=ax_colorbar, orientation='horizontal')
+        ax_colorbar.set_title('Nível de Sinal [dBm]')
+        ax_colorbar.margins(0.1)  # Adiciona margens ao redor da colorbar para acomodar legendas
+        fig_colorbar.tight_layout()  # Garante que todos os elementos da figura sejam bem acomodados
+
+        # Salvando a colorbar
+        colorbar_buffer = io.BytesIO()
+        fig_colorbar.savefig(colorbar_buffer, format='png', transparent=True)
+        colorbar_buffer.seek(0)
+        colorbar_base64 = base64.b64encode(colorbar_buffer.read()).decode('utf-8')
+        plt.close(fig_colorbar)
+
+        return image_base64, colorbar_base64

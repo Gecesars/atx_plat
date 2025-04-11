@@ -1,0 +1,39 @@
+# Ambiente virtual
+venv/
+ENV/
+env/
+.venv/
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Arquivos de log
+*.log
+
+# Diretórios específicos do Flask
+instance/
+STRM/
+
+# Arquivos temporários do sistema
+.DS_Store
+Thumbs.db
+
+# Banco de dados temporário (opcional)
+*.sqlite3
+*.db
+
+# Configurações de IDE
+.vscode/
+.idea/
+
+# Arquivos de compilação
+*.egg-info/
+build/
+dist/
+
+# Arquivos de configuração local
+.env
+*.bak
+*.zip

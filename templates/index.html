@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="pt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - ATX Coverage</title>
+    <link href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body, html {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            background-image: url('static/winxp.jpg'); /* Caminho para a imagem de fundo */
+            background-size: cover;
+            font-family: Arial, sans-serif;
+        }
+
+        .header {
+            position: fixed;
+            top: 0;
+            width: 100%;
+            color: white;
+            background: rgba(0, 0, 139, 0.5); /* Cor de fundo azul escuro com 50% de transparência */
+            text-align: center;
+            padding: 7px 0; /* 30% menos do que o solicitado inicialmente */
+            box-shadow: 0 4px 6px -6px #999;
+        }
+
+        .footer {
+            position: fixed;
+            bottom: 0;
+            width: 100%;
+            color: white;
+            background: rgba(0, 0, 139, 0.5); /* Cor de fundo azul claro semi-transparente */
+            text-align: center;
+            padding: 10px 0;
+            box-shadow: 0 -4px 6px -6px #999;
+        }
+
+        .login-container {
+            width: 300px;
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.5); /* Transparência de 30% */
+            border-radius: 10px;
+            box-shadow: 0 8px 16px rgba(0, 0, 0, 0.3); /* Efeito de sombra para 3D */
+        }
+
+        .form-group {
+            margin-bottom: 15px;
+        }
+
+        label, input, button, a {
+            display: block;
+            width: 100%;
+        }
+
+        input, button {
+            padding: 10px;
+            margin-top: 5px;
+        }
+
+        input {
+            background: #fff;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+
+        button {
+            background-color: #0056b3;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        button:hover {
+            background-color: #003d82;
+        }
+
+        .message {
+            color: red;
+            font-size: 0.9em;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>Bem-vindo à ATX Cover</h1>
+    </div>
+
+    <div class="login-container">
+        <h2 style="text-align:center;">Login</h2>
+        <form action="/login" method="post">
+            <div class="form-group">
+                <label for="username">Usuário:</label>
+                <input type="text" id="username" name="username" required>
+            </div>
+            <div class="form-group">
+                <label for="password">Senha:</label>
+                <input type="password" id="password" name="password" required>
+            </div>
+            <!-- Mensagem de erro -->
+            {% if error %}
+                <p class="message">{{ error }}</p>
+            {% endif %}
+            <div style="text-align:center;">
+                <button type="submit">Entrar</button>
+                <a href="/register">Não tem uma conta? Registre-se</a>
+            </div>
+        </form>
+    </div>
+
+    <div class="footer">
+        <p>Site em desenvolvimento, dúvidas e suporte: e-mail atxcover@gmail.com</p>
+    </div>
+
+    <!-- Bootstrap Bundle with Popper -->
+    <script src="https://code.jquery.com/jquery-3.5.1.slim.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@popperjs/core@2.0.6/dist/umd/popper.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.min.js"></script>
+
+</body>
+</html>

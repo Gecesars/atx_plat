@@ -37,3 +37,7 @@ dist/
 .env
 *.bak
 *.zip
+SRTM/
+__pycache__/
+__pytest_cache__/
+

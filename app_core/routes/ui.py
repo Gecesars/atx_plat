@@ -1006,7 +1006,7 @@ def gerar_img_perfil():
     path = data['path']
 
     Ptx_W   = current_user.transmission_power
-    G_tx_dBi_base = current_user.antenna_gain  # dBi base (pico)
+    G_tx_dBi_base = current_user.antenna_gain or 0.0  # dBi base (pico)
     G_rx_dbi = current_user.rx_gain
     frequency = current_user.frequencia
     totalloss = current_user.total_loss
@@ -1402,7 +1402,7 @@ def calculate_coverage():
     data = request.get_json()
     loss      = current_user.total_loss or 0.0
     Ptx_W     = current_user.transmission_power
-    Gtx_dbi   = current_user.antenna_gain
+    ganho_pico_dBi = current_user.antenna_gain or 0.0
     Grx_dBi   = current_user.rx_gain
     long      = current_user.longitude
     lati      = current_user.latitude

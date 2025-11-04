@@ -6,6 +6,7 @@ import os
 import re
 from datetime import datetime, timedelta
 from math import radians, cos, sin, asin, sqrt, degrees
+from pathlib import Path
 
 import astropy
 import geojson
@@ -598,10 +599,13 @@ def salvar_dados():
             "minSignalLevel": _coerce_float(data.get('minSignalLevel')),
             "maxSignalLevel": _coerce_float(data.get('maxSignalLevel')),
         }
-        existing_settings = project.settings or {}
-        existing_settings.update({k: v for k, v in project_settings_payload.items() if v is not None})
-        existing_settings["lastSavedAt"] = datetime.utcnow().isoformat()
-        project.settings = existing_settings
+        base_settings = project.settings or {}
+        updated_settings = dict(base_settings)
+        for key, value in project_settings_payload.items():
+            if value is not None:
+                updated_settings[key] = value
+        updated_settings["lastSavedAt"] = datetime.utcnow().isoformat()
+        project.settings = updated_settings
 
     # 5. Commit no banco
     try:
@@ -832,12 +836,38 @@ def calculate_distance():
 @login_required
 def mapa():
     maps_key = get_google_maps_key()
+    projects = (
+        current_user.projects.order_by(Project.created_at.asc()).all()
+        if hasattr(current_user, "projects")
+        else []
+    )
+    project_slug = request.args.get('project')
+    active_project = None
+
+    if project_slug:
+        try:
+            active_project = project_by_slug_or_404(project_slug, current_user.uuid)
+        except Exception:
+            flash('Projeto não encontrado ou sem acesso.', 'error')
+            return redirect(url_for('projects.list_projects'))
+    elif projects:
+        active_project = projects[0]
+
     if current_user.latitude is None or current_user.longitude is None:
         flash('Por favor, defina a posição da torre primeiro.', 'error')
+        target_slug = active_project.slug if active_project else (projects[0].slug if projects else None)
+        if target_slug:
+            return redirect(url_for('ui.calcular_cobertura', project=target_slug))
         return redirect(url_for('ui.calcular_cobertura'))
-    else:
-        start_coords = {"lat": current_user.latitude, "lng": current_user.longitude}
-        return render_template('mapa.html', start_coords=start_coords, maps_api_key=maps_key)
+
+    start_coords = {"lat": current_user.latitude, "lng": current_user.longitude}
+    return render_template(
+        'mapa.html',
+        start_coords=start_coords,
+        maps_api_key=maps_key,
+        project=active_project,
+        projects=projects,
+    )
 
 @bp.route('/login', methods=['GET', 'POST'])
 def login():
@@ -2278,6 +2308,8 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
     if coverage_dir is None:
         coverage_dir = storage_root() / str(user.uuid) / project.slug / 'assets' / 'coverage'
         coverage_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        coverage_dir = Path(coverage_dir)
 
     root_path = storage_root()
 
@@ -2301,6 +2333,8 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
     if colorbar_bytes:
         colorbar_path.write_bytes(colorbar_bytes)
 
+    receivers_payload = coverage_payload.get('receivers') or request_payload.get('receivers')
+
     summary_payload = {
         "engine": engine_enum.value,
         "generated_at": timestamp_iso,
@@ -2311,6 +2345,14 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "colorbar_bounds": _clean_json(coverage_payload.get('colorbar_bounds')),
         "scale": _clean_json(coverage_payload.get('scale')),
         "tx_location": _clean_json(coverage_payload.get('center')),
+        "center": _clean_json(coverage_payload.get('center')),
+        "requested_radius_km": _clean_json(coverage_payload.get('requested_radius_km')),
+        "radius": _clean_json(coverage_payload.get('radius')),
+        "gain_components": _clean_json(coverage_payload.get('gain_components')),
+        "signal_level_dict": _clean_json(coverage_payload.get('signal_level_dict')),
+        "signal_level_dict_dbm": _clean_json(coverage_payload.get('signal_level_dict_dbm')),
+        "location_status": coverage_payload.get('location_status'),
+        "receivers": _clean_json(receivers_payload),
     }
     json_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2, default=_json_default))
 
@@ -2379,6 +2421,7 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
     db.session.add(job)
 
     settings = project.settings or {}
+    updated_settings = dict(settings)
     last_coverage = {
         "generated_at": timestamp_iso,
         "engine": engine_enum.value,
@@ -2387,12 +2430,20 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "json_asset_id": str(json_asset.id),
         "radius_km": coverage_payload.get('requested_radius_km'),
         "center_metrics": _clean_json(coverage_payload.get('center_metrics')),
+        "bounds": _clean_json(coverage_payload.get('bounds')),
+        "scale": _clean_json(coverage_payload.get('scale')),
+        "center": _clean_json(coverage_payload.get('center')),
+        "requested_radius_km": _clean_json(coverage_payload.get('requested_radius_km')),
+        "receivers": _clean_json(receivers_payload),
+        "loss_components": _clean_json(coverage_payload.get('loss_components')),
+        "gain_components": _clean_json(coverage_payload.get('gain_components')),
+        "colorbar_bounds": _clean_json(coverage_payload.get('colorbar_bounds')),
     }
     if colorbar_asset:
         last_coverage["colorbar_asset_id"] = str(colorbar_asset.id)
 
-    settings['lastCoverage'] = last_coverage
-    project.settings = settings
+    updated_settings['lastCoverage'] = last_coverage
+    project.settings = updated_settings
 
     return {
         "heatmap_asset": heatmap_asset,
@@ -3106,6 +3157,7 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None):
         # pra desenhar o círculo azul e pra atualizar o painel.
         "center": {"lat": float(lat_tx_deg), "lng": float(lon_tx_deg)},
         "requested_radius_km": radius_km,
+        "radius": data.get('radius', radius_km),
 
         "location_status": location_status,
         "location_changed": location_changed,
@@ -3150,7 +3202,10 @@ def calculate_coverage():
     if engine_value not in {engine.value for engine in CoverageEngine}:
         engine_value = CoverageEngine.p1546.value
 
+    receivers = data.get('receivers') or []
+
     result = _compute_coverage_map(current_user, data)
+    result['receivers'] = receivers
 
     persisted = None
     try:
@@ -3165,10 +3220,21 @@ def calculate_coverage():
                 'id': str(persisted['heatmap_asset'].id),
                 'path': persisted['heatmap_asset'].path,
             }
+            if persisted.get('json_asset'):
+                result['assets']['summary'] = {
+                    'id': str(persisted['json_asset'].id),
+                    'path': persisted['json_asset'].path,
+                }
+            if persisted.get('colorbar_asset'):
+                result['assets']['colorbar'] = {
+                    'id': str(persisted['colorbar_asset'].id),
+                    'path': persisted['colorbar_asset'].path,
+                }
             result['coverage_job_id'] = str(persisted['job'].id)
             result['generated_at'] = persisted['timestamp']
             if project:
                 result['project_slug'] = project.slug
+                result['lastCoverage'] = (project.settings or {}).get('lastCoverage')
 
     return jsonify(result)
 
@@ -3319,15 +3385,20 @@ def visualizar_dados_salvos():
         summary = settings.get('lastCoverage')
         asset_id = summary.get('asset_id') if summary else None
         if summary and asset_id:
-            coverage_cards.append({
-                'project': project,
-                'engine': summary.get('engine'),
-                'generated_at': summary.get('generated_at'),
-                'radius_km': summary.get('radius_km'),
-                'center_metrics': summary.get('center_metrics'),
-                'preview_url': url_for('projects.asset_preview', slug=project.slug, asset_id=asset_id),
-                'detail_url': url_for('projects.view_project', slug=project.slug),
-            })
+            try:
+                preview_url = url_for('projects.asset_preview', slug=project.slug, asset_id=asset_id)
+            except Exception:
+                preview_url = None
+            if preview_url:
+                coverage_cards.append({
+                    'project': project,
+                    'engine': summary.get('engine'),
+                    'generated_at': summary.get('generated_at'),
+                    'radius_km': summary.get('radius_km'),
+                    'center_metrics': summary.get('center_metrics'),
+                    'preview_url': preview_url,
+                    'detail_url': url_for('projects.view_project', slug=project.slug),
+                })
 
     return render_template('dados_salvos.html', dados_salvos=dados_salvos, image_data=image_data, coverage_cards=coverage_cards)
 

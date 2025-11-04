@@ -33,7 +33,7 @@
                                 <span data-bs-toggle="tooltip" title="Identificador curto utilizado nas URLs e no armazenamento.">Slug: {{ project.slug }}</span>
                                 <span data-bs-toggle="tooltip" title="Sistema de referência espacial do projeto (EPSG:4326 = latitude/longitude).">CRS: {{ project.crs }}</span>
                             </div>
-                            {% if last_coverage %}
+                            {% if last_coverage and last_coverage.asset_id %}
                                 <div class="d-flex align-items-center gap-3 mt-3">
                                     <div class="rounded overflow-hidden shadow-sm" style="width: 120px;">
                                         <img src="{{ url_for('projects.asset_preview', slug=project.slug, asset_id=last_coverage['asset_id']) }}" alt="Prévia da cobertura" class="img-fluid">

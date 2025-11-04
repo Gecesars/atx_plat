@@ -69,8 +69,8 @@
             </div>
 
             <div class="unit-toggle-group" role="group" aria-label="Unidade da escala">
-                <button type="button" class="btn btn-sm btn-outline-primary active" id="unitDbuv" aria-pressed="true">Campo dBµV/m</button>
-                <button type="button" class="btn btn-sm btn-outline-primary" id="unitDbm" aria-pressed="false">Potência dBm</button>
+                <button type="button" class="btn btn-sm btn-outline-primary active" id="unitDbuv" aria-pressed="true" data-disabled-during-coverage>Campo dBµV/m</button>
+                <button type="button" class="btn btn-sm btn-outline-primary" id="unitDbm" aria-pressed="false" data-disabled-during-coverage>Potência dBm</button>
             </div>
 
             <button class="btn btn-brand w-100" id="btnGenerateCoverage">Gerar cobertura</button>
@@ -228,7 +228,7 @@
         </div>
     </aside>
 
-    <div class="map-canvas">
+    <div class="map-canvas" id="coverageMapContainer" data-project="{{ project.slug if project else '' }}" data-start-lat="{{ start_coords.lat if start_coords else '' }}" data-start-lng="{{ start_coords.lng if start_coords else '' }}">
         <div id="coverageMap" class="map-container"></div>
         <div id="coverageSpinner" class="map-loading" hidden>
             <div class="coverage-spinner-icon" aria-hidden="true"></div>

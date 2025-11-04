@@ -48,6 +48,42 @@ function formatAzimuth(value) {
     return `${normalizeAzimuth(value).toFixed(1)}°`;
 }
 
+function formatWithUnit(value, unit) {
+    if (value === undefined || value === null || Number.isNaN(Number(value))) {
+        return '-';
+    }
+    return `${Number(value).toFixed(2)} ${unit}`;
+}
+
+function parseNullableNumber(raw) {
+    if (raw === undefined || raw === null) {
+        return null;
+    }
+    const text = String(raw).trim();
+    if (!text) {
+        return null;
+    }
+    const asNumber = Number(text);
+    return Number.isFinite(asNumber) ? asNumber : null;
+}
+
+function blobToBase64(blob) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => {
+            const result = reader.result;
+            if (typeof result === 'string') {
+                const base64 = result.includes(',') ? result.split(',')[1] : result;
+                resolve(base64);
+            } else {
+                reject(new Error('Falha ao converter imagem.'));
+            }
+        };
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(blob);
+    });
+}
+
 function updateRadiusLabel() {
     const radiusInput = document.getElementById('radiusInput');
     const radiusValue = document.getElementById('radiusValue');
@@ -75,8 +111,9 @@ function clearDirectionLine() {
 }
 
 function getActiveRadiusKm() {
-    if (state.coverageData && Number.isFinite(state.coverageData.requested_radius_km)) {
-        return Number(state.coverageData.requested_radius_km);
+    const lastRadius = state.coverageData?.requested_radius_km || state.coverageData?.radius || null;
+    if (Number.isFinite(lastRadius)) {
+        return Number(lastRadius);
     }
     const radiusInput = document.getElementById('radiusInput');
     if (radiusInput) {
@@ -144,6 +181,35 @@ function updateTxSummary(data) {
         directionControl.value = directionValue;
         updateDirectionLabel(directionValue);
     }
+
+    const municipalityEl = document.getElementById('txMunicipio');
+    if (municipalityEl) {
+        municipalityEl.textContent = data.txLocationName
+            || data.tx_location_name
+            || data.municipality
+            || '-';
+    }
+
+    const elevationEl = document.getElementById('txElevation');
+    if (elevationEl) {
+        const elevationValue = data.txElevation ?? data.tx_site_elevation;
+        elevationEl.textContent = elevationValue !== undefined && elevationValue !== null
+            ? formatNumber(elevationValue, ' m')
+            : '-';
+    }
+
+    const climateInfoEl = document.getElementById('txClimateInfo');
+    if (climateInfoEl) {
+        const message = data.location_status || data.locationStatus;
+        if (message) {
+            climateInfoEl.textContent = message;
+        } else if (data.climateUpdatedAt) {
+            const updatedDate = new Date(data.climateUpdatedAt);
+            climateInfoEl.textContent = `Clima atualizado em ${updatedDate.toLocaleString()}`;
+        } else {
+            climateInfoEl.textContent = 'Clima não ajustado para esta localização';
+        }
+    }
 }
 
 function updateGainSummary(gainComponents, scale) {
@@ -170,6 +236,110 @@ function updateGainSummary(gainComponents, scale) {
     }
 }
 
+function updateCenterSummary(metrics) {
+    const data = metrics || {};
+    document.getElementById('centerLoss').textContent = formatWithUnit(data.combined_loss_center_db, 'dB');
+    document.getElementById('centerPower').textContent = formatWithUnit(data.received_power_center_dbm, 'dBm');
+    document.getElementById('centerField').textContent = formatWithUnit(data.field_center_dbuv_m, 'dBµV/m');
+    document.getElementById('centerGain').textContent = formatWithUnit(data.effective_gain_center_db, 'dB');
+
+    const pathInfo = document.getElementById('pathTypeInfo');
+    if (pathInfo) {
+        pathInfo.textContent = data.path_type ? `Classe de propagação no centro: ${data.path_type}` : '';
+    }
+
+    const distanceValue = data.distance_center_km ?? data.radius_km ?? null;
+    document.getElementById('centerDistance').textContent = formatWithUnit(distanceValue, 'km');
+    const summaryElement = document.getElementById('centerPath');
+    if (summaryElement) {
+        summaryElement.textContent = data.path_type || '-';
+    }
+}
+
+function updateLossSummary(lossComponents) {
+    const mapping = {
+        L_b0p: 'loss-L_b0p',
+        L_bd: 'loss-L_bd',
+        L_bs: 'loss-L_bs',
+        L_ba: 'loss-L_ba',
+        L_b: 'loss-L_b',
+        L_b_corr: 'loss-L_b_corr',
+    };
+
+    Object.entries(mapping).forEach(([key, elementId]) => {
+        const element = document.getElementById(elementId);
+        if (!element) {
+            return;
+        }
+        const component = lossComponents ? lossComponents[key] : null;
+        if (!component) {
+            element.textContent = '-';
+            return;
+        }
+        const centerText = component.center !== undefined && component.center !== null
+            ? formatDb(component.center)
+            : '-';
+        if (component.min !== undefined && component.max !== undefined) {
+            element.textContent = `${centerText} (${formatDb(component.min)} – ${formatDb(component.max)})`;
+        } else {
+            element.textContent = centerText;
+        }
+    });
+}
+
+function refreshReceiverSummaries() {
+    if (!state.rxEntries.length || !state.txCoords) {
+        updateLinkSummary({});
+        return;
+    }
+    state.rxEntries.forEach((entry, idx) => {
+        const position = entry.marker.getPosition();
+        computeReceiverSummary(position).then((summary) => {
+            entry.summary = summary;
+            if (idx === state.selectedRxIndex) {
+                updateLinkSummary(summary);
+            }
+            renderRxList();
+        });
+    });
+}
+
+function serializeReceivers() {
+    return state.rxEntries
+        .map((entry) => {
+            const position = entry.marker.getPosition();
+            const lat = Number(position.lat());
+            const lng = Number(position.lng());
+            if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+                return null;
+            }
+            return {
+                lat: Number(lat.toFixed(7)),
+                lng: Number(lng.toFixed(7)),
+            };
+        })
+        .filter(Boolean);
+}
+
+function restoreReceivers(receivers) {
+    clearReceivers();
+    if (!Array.isArray(receivers) || !receivers.length || !state.map) {
+        return;
+    }
+    receivers.forEach((receiver) => {
+        const lat = parseNullableNumber(receiver.lat);
+        const lng = parseNullableNumber(receiver.lng);
+        if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+            return;
+        }
+        const position = new google.maps.LatLng(lat, lng);
+        createRxMarker(position, { selectOnCreate: false });
+    });
+    state.selectedRxIndex = null;
+    updateLinkSummary({});
+    renderRxList();
+}
+
 function showToast(message, isError = false) {
     const card = document.getElementById('mapTooltip');
     if (!card) return;
@@ -189,6 +359,10 @@ function setCoverageLoading(isLoading) {
     if (button) {
         button.disabled = isLoading;
     }
+    const toggleElements = document.querySelectorAll('[data-disabled-during-coverage]');
+    toggleElements.forEach((element) => {
+        element.disabled = isLoading;
+    });
 }
 
 function ensureElevationService() {
@@ -196,6 +370,40 @@ function ensureElevationService() {
         state.elevationService = new google.maps.ElevationService();
     }
     return state.elevationService;
+}
+
+function restoreCoverageFromProject(data) {
+    if (!data || !data.lastCoverage) {
+        return;
+    }
+    const last = data.lastCoverage;
+    if (last.center_metrics) {
+        updateGainSummary(null, null);
+        document.getElementById('centerLoss').textContent = formatDb(last.center_metrics.combined_loss_center_db);
+        document.getElementById('centerPower').textContent = formatDb(last.center_metrics.received_power_center_dbm);
+        document.getElementById('centerField').textContent = formatNumber(last.center_metrics.field_center_dbuv_m, ' dBµV/m');
+    }
+
+    const radiusInput = document.getElementById('radiusInput');
+    if (radiusInput && last.radius_km) {
+        radiusInput.value = last.radius_km;
+        updateRadiusLabel();
+    }
+
+    if (last.center) {
+        setTxCoords(new google.maps.LatLng(last.center.lat, last.center.lng), { pan: false });
+    }
+
+    if (last.asset_id) {
+        applyCoverageOverlay({
+            images: {
+                dbuv: { image: last.preview, colorbar: null },
+            },
+            bounds: data.bounds,
+            requested_radius_km: last.radius_km,
+            center: data.center,
+        });
+    }
 }
 
 function clearCoverageOverlay() {
@@ -275,6 +483,11 @@ function applyCoverageOverlay(response) {
         const img = document.getElementById('colorbarImage');
         img.src = `data:image/png;base64,${colorbarImage}`;
         card.hidden = false;
+    } else {
+        const card = document.getElementById('colorbarCard');
+        if (card) {
+            card.hidden = true;
+        }
     }
 
     // Desenha o círculo de raio (apenas visual)
@@ -295,6 +508,152 @@ function applyCoverageOverlay(response) {
     }
 
     refreshDirectionGuide();
+}
+
+async function loadCoverageOverlay(lastCoverage) {
+    if (!lastCoverage || !lastCoverage.asset_id) {
+        throw new Error('Nenhuma mancha de cobertura disponível para este projeto.');
+    }
+    if (!window.coverageProjectSlug) {
+        throw new Error('Projeto não informado para restaurar a cobertura.');
+    }
+
+    const slug = window.coverageProjectSlug;
+    const summaryId = lastCoverage.json_asset_id;
+    let summary = null;
+
+    if (summaryId) {
+        try {
+            const summaryResponse = await fetch(
+                `/projects/${encodeURIComponent(slug)}/assets/${encodeURIComponent(summaryId)}/preview`,
+                { headers: { Accept: 'application/json' } },
+            );
+            if (summaryResponse.ok) {
+                summary = await summaryResponse.json();
+            }
+        } catch (error) {
+            console.warn('Falha ao carregar resumo da cobertura.', error);
+        }
+    }
+
+    const heatmapResponse = await fetch(
+        `/projects/${encodeURIComponent(slug)}/assets/${encodeURIComponent(lastCoverage.asset_id)}/preview`
+    );
+    if (!heatmapResponse.ok) {
+        throw new Error('Não foi possível carregar a imagem da cobertura.');
+    }
+    const heatmapBase64 = await blobToBase64(await heatmapResponse.blob());
+
+    let colorbarBase64 = null;
+    if (lastCoverage.colorbar_asset_id) {
+        try {
+            const colorbarResponse = await fetch(
+                `/projects/${encodeURIComponent(slug)}/assets/${encodeURIComponent(lastCoverage.colorbar_asset_id)}/preview`
+            );
+            if (colorbarResponse.ok) {
+                colorbarBase64 = await blobToBase64(await colorbarResponse.blob());
+            }
+        } catch (error) {
+            console.warn('Falha ao carregar barra de cores da cobertura.', error);
+        }
+    }
+
+    const coveragePayload = {
+        images: {
+            dbuv: {
+                image: heatmapBase64,
+                colorbar: colorbarBase64,
+                label: summary?.scale?.label || 'Campo elétrico [dBµV/m]',
+                unit: 'dBµV/m',
+            },
+        },
+        bounds: summary?.bounds || lastCoverage.bounds,
+        colorbar_bounds: summary?.colorbar_bounds || lastCoverage.colorbar_bounds,
+        scale: summary?.scale || lastCoverage.scale,
+        center: summary?.center || lastCoverage.center,
+        requested_radius_km: summary?.requested_radius_km
+            || lastCoverage.requested_radius_km
+            || lastCoverage.radius_km,
+        radius: lastCoverage.radius_km,
+        gain_components: summary?.gain_components || lastCoverage.gain_components,
+        loss_components: summary?.loss_components || lastCoverage.loss_components,
+        center_metrics: summary?.center_metrics || lastCoverage.center_metrics,
+        signal_level_dict: summary?.signal_level_dict,
+        signal_level_dict_dbm: summary?.signal_level_dict_dbm,
+        location_status: summary?.location_status || lastCoverage.location_status,
+        receivers: lastCoverage.receivers || summary?.receivers || [],
+    };
+
+    const centerLat = parseNullableNumber(
+        coveragePayload.center?.lat ?? coveragePayload.center?.latitude
+    );
+    const centerLng = parseNullableNumber(
+        coveragePayload.center?.lng ?? coveragePayload.center?.longitude
+    );
+    if (Number.isFinite(centerLat) && Number.isFinite(centerLng)) {
+        coveragePayload.center = { lat: centerLat, lng: centerLng };
+    } else {
+        coveragePayload.center = null;
+    }
+
+    const requestedRadius = parseNullableNumber(coveragePayload.requested_radius_km);
+    const radiusKm = parseNullableNumber(coveragePayload.radius ?? lastCoverage.radius_km);
+    coveragePayload.requested_radius_km = requestedRadius ?? radiusKm ?? null;
+    coveragePayload.radius = radiusKm ?? requestedRadius ?? null;
+
+    state.coverageData = {
+        ...(state.coverageData || {}),
+        ...lastCoverage,
+        ...coveragePayload,
+        summary,
+    };
+    state.coverageData.asset_id = lastCoverage.asset_id;
+    state.coverageData.json_asset_id = lastCoverage.json_asset_id;
+    state.coverageData.colorbar_asset_id = lastCoverage.colorbar_asset_id;
+    state.coverageData.engine = lastCoverage.engine || state.coverageData.engine || 'p1546';
+    state.coverageData.receivers = coveragePayload.receivers;
+    state.coverageData.signal_level_dict = coveragePayload.signal_level_dict;
+    state.coverageData.signal_level_dict_dbm = coveragePayload.signal_level_dict_dbm;
+    state.coverageData.project_slug = window.coverageProjectSlug || state.coverageData.project_slug;
+
+    if (state.txData) {
+        state.txData.location_status = coveragePayload.location_status || state.txData.location_status;
+        if (coveragePayload.center) {
+            state.txData.latitude = coveragePayload.center.lat;
+            state.txData.longitude = coveragePayload.center.lng;
+        }
+        updateTxSummary(state.txData);
+    }
+
+    if (coveragePayload.center) {
+        const centerLatLng = new google.maps.LatLng(coveragePayload.center.lat, coveragePayload.center.lng);
+        setTxCoords(centerLatLng, { pan: false });
+    }
+
+    if (coveragePayload.requested_radius_km) {
+        const radiusInput = document.getElementById('radiusInput');
+        if (radiusInput) {
+            const radiusValue = Number(coveragePayload.requested_radius_km);
+            if (Number.isFinite(radiusValue)) {
+                radiusInput.value = Math.max(radiusValue, Number(radiusInput.min) || 0);
+            }
+            updateRadiusLabel();
+        }
+    }
+
+    applyCoverageOverlay(coveragePayload);
+    updateGainSummary(coveragePayload.gain_components, coveragePayload.scale);
+    updateLossSummary(coveragePayload.loss_components);
+    updateCenterSummary(coveragePayload.center_metrics);
+
+    if (Array.isArray(coveragePayload.receivers)) {
+        restoreReceivers(coveragePayload.receivers);
+        refreshReceiverSummaries();
+        state.coverageData.receivers = serializeReceivers();
+    }
+
+    showToast('Última cobertura restaurada.');
+    return coveragePayload;
 }
 
 function setOverlayOpacity(value) {
@@ -371,6 +730,9 @@ function removeRx(index) {
     state.selectedRxIndex = null;
     updateLinkSummary({});
     renderRxList();
+    if (state.coverageData) {
+        state.coverageData.receivers = serializeReceivers();
+    }
 }
 
 function clearReceivers() {
@@ -386,6 +748,9 @@ function clearReceivers() {
     updateLinkSummary({});
     renderRxList();
     document.getElementById('btnGenerateProfile').disabled = true;
+    if (state.coverageData) {
+        state.coverageData.receivers = [];
+    }
 }
 
 function renderRxList() {
@@ -490,7 +855,9 @@ function computeReceiverSummary(position) {
     });
 }
 
-function createRxMarker(position) {
+function createRxMarker(position, options = {}) {
+    const { selectOnCreate = true } = options;
+
     const defaultIcon = {
         path: google.maps.SymbolPath.CIRCLE,
         fillColor: '#6610f2',
@@ -539,7 +906,12 @@ function createRxMarker(position) {
     });
 
     renderRxList();
-    selectRx(state.rxEntries.length - 1);
+    if (selectOnCreate) {
+        selectRx(state.rxEntries.length - 1);
+    }
+    if (state.coverageData) {
+        state.coverageData.receivers = serializeReceivers();
+    }
 }
 
 function handleMapClick(event) {
@@ -664,76 +1036,183 @@ function saveDirection(value) {
     }, 350);
 }
 
+function confirmPersistAndGenerate(options = {}) {
+    const { requireConfirm = false } = options;
+    const radiusInput = document.getElementById('radiusInput');
+    const radiusValue = parseNullableNumber(radiusInput?.value);
+    if (!Number.isFinite(radiusValue) || radiusValue <= 0) {
+        throw new Error('Informe um raio válido antes de gerar a cobertura.');
+    }
+
+    const minField = parseNullableNumber(document.getElementById('minField')?.value);
+    const maxField = parseNullableNumber(document.getElementById('maxField')?.value);
+
+    if (!state.txCoords) {
+        throw new Error('Posição da TX não definida.');
+    }
+
+    if (requireConfirm) {
+        const accept = window.confirm('Deseja atualizar a mancha de cobertura usando os parâmetros atuais?');
+        if (!accept) {
+            return null;
+        }
+    }
+
+    const coordinates = {
+        lat: state.txCoords.lat(),
+        lng: state.txCoords.lng(),
+    };
+
+    const payload = {
+        projectSlug: window.coverageProjectSlug || null,
+        coverageEngine: state.coverageData?.engine || state.txData?.coverageEngine || 'p1546',
+        radius: radiusValue,
+        minSignalLevel: minField,
+        maxSignalLevel: maxField,
+        customCenter: coordinates,
+        receivers: serializeReceivers(),
+    };
+
+    return fetch('/calculate-coverage', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    })
+        .then((response) => {
+            if (!response.ok) {
+                return response.json()
+                    .catch(() => ({}))
+                    .then((payload) => {
+                        throw new Error(payload.error || 'Falha ao gerar cobertura');
+                    });
+            }
+            return response.json();
+        })
+        .then((data) => {
+            const coverageState = {
+                ...(state.coverageData || {}),
+                ...data,
+            };
+
+            if (data.assets?.heatmap?.id) {
+                coverageState.asset_id = data.assets.heatmap.id;
+            }
+            if (data.assets?.summary?.id) {
+                coverageState.json_asset_id = data.assets.summary.id;
+            }
+            if (data.assets?.colorbar?.id) {
+                coverageState.colorbar_asset_id = data.assets.colorbar.id;
+            }
+            if (data.lastCoverage) {
+                coverageState.asset_id = data.lastCoverage.asset_id || coverageState.asset_id;
+                coverageState.json_asset_id = data.lastCoverage.json_asset_id || coverageState.json_asset_id;
+                coverageState.colorbar_asset_id = data.lastCoverage.colorbar_asset_id || coverageState.colorbar_asset_id;
+                coverageState.radius_km = data.lastCoverage.radius_km ?? coverageState.radius_km;
+                coverageState.requested_radius_km = data.lastCoverage.requested_radius_km ?? coverageState.requested_radius_km;
+                coverageState.center_metrics = data.lastCoverage.center_metrics || coverageState.center_metrics;
+                coverageState.receivers = data.lastCoverage.receivers || coverageState.receivers;
+            }
+
+            coverageState.requested_radius_km = data.requested_radius_km ?? coverageState.requested_radius_km ?? payload.radius;
+            coverageState.radius_km = data.radius ?? coverageState.radius_km ?? payload.radius;
+            coverageState.center_metrics = data.center_metrics || coverageState.center_metrics;
+            coverageState.loss_components = data.loss_components || coverageState.loss_components;
+            coverageState.gain_components = data.gain_components || coverageState.gain_components;
+            coverageState.scale = data.scale || coverageState.scale;
+            coverageState.bounds = data.bounds || coverageState.bounds;
+            coverageState.location_status = data.location_status || coverageState.location_status;
+
+            coverageState.project_slug = data.project_slug || coverageState.project_slug || payload.projectSlug;
+            coverageState.generated_at = data.generated_at || coverageState.generated_at;
+            coverageState.engine = coverageState.engine || payload.coverageEngine;
+            coverageState.receivers = serializeReceivers();
+
+            state.coverageData = coverageState;
+
+            const centerLat = parseNullableNumber(data.center?.lat ?? data.center?.latitude);
+            const centerLng = parseNullableNumber(data.center?.lng ?? data.center?.longitude);
+            if (Number.isFinite(centerLat) && Number.isFinite(centerLng)) {
+                const centerLatLng = new google.maps.LatLng(centerLat, centerLng);
+                setTxCoords(centerLatLng, { pan: false });
+            }
+
+            if (Number.isFinite(data.requested_radius_km)) {
+                const radiusEl = document.getElementById('radiusInput');
+                if (radiusEl) {
+                    radiusEl.value = Math.max(Number(data.requested_radius_km), Number(radiusEl.min) || 0);
+                    updateRadiusLabel();
+                }
+            }
+
+            if (data.antenna_direction !== undefined && data.antenna_direction !== null) {
+                const normalizedDirection = normalizeAzimuth(data.antenna_direction);
+                if (state.txData) {
+                    state.txData.antennaDirection = normalizedDirection;
+                }
+                updateDirectionLabel(normalizedDirection);
+                const directionDisplay = document.getElementById('txDirection');
+                if (directionDisplay) {
+                    directionDisplay.textContent = formatAzimuth(normalizedDirection);
+                }
+                refreshDirectionGuide();
+            }
+
+            applyCoverageOverlay(data);
+            updateGainSummary(data.gain_components, data.scale);
+            updateLossSummary(data.loss_components);
+            updateCenterSummary(data.center_metrics);
+
+            state.coverageData.signal_level_dict = data.signal_level_dict;
+            state.coverageData.signal_level_dict_dbm = data.signal_level_dict_dbm;
+
+            if (state.txData) {
+                if (data.txLocationName || data.tx_location_name) {
+                    state.txData.txLocationName = data.txLocationName || data.tx_location_name;
+                }
+                if (data.txElevation !== undefined || data.tx_site_elevation !== undefined) {
+                    state.txData.txElevation = data.txElevation ?? data.tx_site_elevation;
+                }
+                state.txData.location_status = data.location_status || state.txData.location_status;
+                updateTxSummary(state.txData);
+            }
+
+            refreshReceiverSummaries();
+            showToast('Cobertura atualizada com sucesso');
+        });
+}
+
 function generateCoverage() {
     if (!state.txCoords) {
         showToast('Defina a posição da TX antes de gerar a cobertura', true);
         return;
     }
 
-    const radiusKm = Number(document.getElementById('radiusInput').value) || 0;
-    const minField = document.getElementById('minField').value;
-    const maxField = document.getElementById('maxField').value;
-
-    const payload = {
-        radius: radiusKm,
-        minSignalLevel: minField || null,
-        maxSignalLevel: maxField || null,
-        customCenter: { lat: state.txCoords.lat(), lng: state.txCoords.lng() },
-    };
-
     setCoverageLoading(true);
-
-    fetch('/calculate-coverage', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-    })
-    .then((response) => {
-        if (!response.ok) {
-            return response.json()
-                .catch(() => ({}))
-                .then((errorPayload) => {
-                    const message = errorPayload?.error || errorPayload?.message || 'Falha ao gerar cobertura';
-                    throw new Error(message);
-                });
-        }
-        return response.json();
-    })
-    .then((data) => {
-        state.coverageData = data;
-
-        if (data.center) {
-            const centerLatLng = new google.maps.LatLng(data.center.lat, data.center.lng);
-            setTxCoords(centerLatLng, { pan: false });
-        }
-
-        if (data.antenna_direction !== undefined && data.antenna_direction !== null) {
-            const normalizedDirection = normalizeAzimuth(data.antenna_direction);
-
-            if (state.txData) {
-                state.txData.antennaDirection = normalizedDirection;
-                updateTxSummary(state.txData);
-            } else {
-                updateDirectionLabel(normalizedDirection);
-                const directionDisplay = document.getElementById('txDirection');
-                if (directionDisplay) {
-                    directionDisplay.textContent = formatAzimuth(normalizedDirection);
-                }
-            }
-        }
-
-        applyCoverageOverlay(data);
-        updateGainSummary(data.gain_components, data.scale);
-        showToast('Cobertura atualizada com sucesso');
-    })
-    .catch((error) => {
-        console.error(error);
-        const message = (error && error.message) ? error.message : 'Não foi possível gerar a cobertura';
-        showToast(message, true);
-    })
-    .finally(() => {
+    let operation = null;
+    try {
+        operation = confirmPersistAndGenerate({
+            requireConfirm: Boolean(state.coverageData?.asset_id),
+        });
+    } catch (error) {
         setCoverageLoading(false);
-    });
+        console.error(error);
+        showToast(error.message || 'Não foi possível preparar a geração da cobertura', true);
+        return;
+    }
+
+    if (!operation) {
+        setCoverageLoading(false);
+        return;
+    }
+
+    operation
+        .catch((error) => {
+            console.error(error);
+            showToast(error.message || 'Não foi possível gerar a cobertura', true);
+        })
+        .finally(() => {
+            setCoverageLoading(false);
+        });
 }
 
 function generateProfile() {
@@ -779,7 +1258,10 @@ function generateProfile() {
 }
 
 function initControls() {
-    document.getElementById('radiusInput').addEventListener('input', updateRadiusLabel);
+    const radiusInput = document.getElementById('radiusInput');
+    if (radiusInput) {
+        radiusInput.addEventListener('input', updateRadiusLabel);
+    }
     document.getElementById('btnGenerateCoverage').addEventListener('click', generateCoverage);
     document.getElementById('btnGenerateProfile').addEventListener('click', generateProfile);
     document.getElementById('btnClearRx').addEventListener('click', clearReceivers);
@@ -831,15 +1313,78 @@ function initControls() {
 }
 
 function initCoverageMap() {
-    fetch('/carregar-dados')
+    const params = new URLSearchParams();
+    const container = document.getElementById('coverageMapContainer');
+    if (container && container.dataset.project) {
+        params.append('project', container.dataset.project);
+        window.coverageProjectSlug = container.dataset.project;
+    }
+
+    fetch(`/carregar-dados?${params.toString()}`)
         .then((response) => response.json())
         .then((data) => {
             state.txData = { ...data };
+            state.txData.coverageEngine = data.coverageEngine || data.coverage_engine || state.txData.coverageEngine;
+            state.txData.txElevation = data.txElevation ?? data.tx_site_elevation ?? state.txData.txElevation;
+            state.txData.txLocationName = data.txLocationName || data.tx_location_name || data.municipality || state.txData.txLocationName;
+            if (data.projectSettings?.lastCoverage?.location_status) {
+                state.txData.location_status = data.projectSettings.lastCoverage.location_status;
+            }
 
-            const txLatLng = new google.maps.LatLng(data.latitude, data.longitude);
+            state.coverageData = data.projectSettings?.lastCoverage
+                ? { ...data.projectSettings.lastCoverage }
+                : null;
+            if (state.coverageData) {
+                state.coverageData.project_slug = window.coverageProjectSlug || state.coverageData.project_slug;
+                state.coverageData.engine = state.coverageData.engine || state.txData.coverageEngine || 'p1546';
+                if (state.coverageData.center_metrics) {
+                    updateCenterSummary(state.coverageData.center_metrics);
+                }
+                if (state.coverageData.loss_components) {
+                    updateLossSummary(state.coverageData.loss_components);
+                }
+                const storedRadius = parseNullableNumber(
+                    state.coverageData.requested_radius_km ?? state.coverageData.radius_km
+                );
+                if (Number.isFinite(storedRadius)) {
+                    const radiusInput = document.getElementById('radiusInput');
+                    if (radiusInput) {
+                        radiusInput.value = Math.max(storedRadius, Number(radiusInput.min) || 0);
+                        updateRadiusLabel();
+                    }
+                }
+            }
+
+            if (!window.coverageProjectSlug) {
+                if (data.projectSlug) {
+                    window.coverageProjectSlug = data.projectSlug;
+                } else if (state.coverageData?.project_slug) {
+                    window.coverageProjectSlug = state.coverageData.project_slug;
+                }
+            }
+
+            const lat = parseNullableNumber(data.latitude);
+            const lng = parseNullableNumber(data.longitude);
+            const fallbackLat = container ? parseNullableNumber(container.dataset.startLat) : null;
+            const fallbackLng = container ? parseNullableNumber(container.dataset.startLng) : null;
+            const txLatLng = (Number.isFinite(lat) && Number.isFinite(lng))
+                ? new google.maps.LatLng(lat, lng)
+                : (Number.isFinite(fallbackLat) && Number.isFinite(fallbackLng)
+                    ? new google.maps.LatLng(fallbackLat, fallbackLng)
+                    : new google.maps.LatLng(0, 0));
             state.txCoords = txLatLng;
+            if (Number.isFinite(lat)) {
+                state.txData.latitude = lat;
+            } else if (Number.isFinite(fallbackLat)) {
+                state.txData.latitude = fallbackLat;
+            }
+            if (Number.isFinite(lng)) {
+                state.txData.longitude = lng;
+            } else if (Number.isFinite(fallbackLng)) {
+                state.txData.longitude = fallbackLng;
+            }
 
-            updateTxSummary(data);
+            updateTxSummary(state.txData);
 
             state.map = new google.maps.Map(document.getElementById('coverageMap'), {
                 center: txLatLng,
@@ -866,6 +1411,23 @@ function initCoverageMap() {
             initControls();
             refreshDirectionGuide();
             ensureElevationService();
+
+            if (state.coverageData) {
+                state.coverageData.signal_level_dict = null;
+                state.coverageData.signal_level_dict_dbm = null;
+            }
+
+            if (state.coverageData && state.coverageData.asset_id) {
+                loadCoverageOverlay(state.coverageData)
+                    .catch((error) => {
+                        console.warn('Não foi possível restaurar a cobertura', error);
+                        if (Array.isArray(state.coverageData?.receivers)) {
+                            restoreReceivers(state.coverageData.receivers);
+                        }
+                    });
+            } else if (state.coverageData && Array.isArray(state.coverageData.receivers)) {
+                restoreReceivers(state.coverageData.receivers);
+            }
         })
         .catch((error) => {
             console.error('Erro ao carregar dados do usuário', error);

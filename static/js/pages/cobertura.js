@@ -280,6 +280,8 @@
         } catch (error) {
             console.error(error);
             notify(error.message || 'Falha ao carregar parâmetros.', 'danger');
+        } finally {
+            updateGenerateButton();
         }
     }
 
@@ -391,7 +393,7 @@
             customCenter: { lat: coords.lat, lng: coords.lon },
         };
 
-        notify('Gerando cobertura...', 'info', 0);
+        notify('Gerando cobertura...', 'info', 4000);
 
         try {
             const response = await fetch('/calculate-coverage', {

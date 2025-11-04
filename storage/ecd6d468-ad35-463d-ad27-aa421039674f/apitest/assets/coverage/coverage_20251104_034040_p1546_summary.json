@@ -1,0 +1,39 @@
+{
+  "engine": "p1546",
+  "generated_at": "2025-11-04T03:40:40.613844",
+  "request": {
+    "radius": 15
+  },
+  "center_metrics": {
+    "field_center_dbuv_m": 57.3,
+    "received_power_center_dbm": -66.1,
+    "combined_loss_center_db": 120.4
+  },
+  "loss_components": {
+    "L_b": {
+      "min": 100,
+      "max": 150
+    }
+  },
+  "bounds": {
+    "north": -22.0,
+    "south": -23.0,
+    "east": -46.0,
+    "west": -47.0
+  },
+  "colorbar_bounds": {
+    "north": -22.0,
+    "south": -22.1,
+    "east": -46.0,
+    "west": -47.0
+  },
+  "scale": {
+    "default_unit": "dbuv",
+    "min": -60,
+    "max": 60
+  },
+  "tx_location": {
+    "lat": -22.9,
+    "lng": -47.0
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "en": {
+    "welcome": "Welcome",
+    "error": "An error occurred"
+  },
+  "pt": {
+    "welcome": "Bem-vindo",
+    "error": "Ocorreu um erro"
+  }
+}

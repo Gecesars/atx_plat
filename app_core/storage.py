@@ -56,3 +56,20 @@ def iter_user_projects(user_uuid: str) -> Iterable[Path]:
     if not user_dir.exists():
         return []
     return [p for p in user_dir.iterdir() if p.is_dir()]
+
+
+def ensure_project_path_exists(project, *path_parts) -> Path:
+    """
+    Ensures a specific path within a project's storage exists and returns it.
+    """
+    base_path = project_storage_path(str(project.user_uuid), project.slug)
+    full_path = base_path.joinpath(*path_parts)
+    full_path.mkdir(parents=True, exist_ok=True)
+    return full_path
+
+def get_project_asset_path(project, asset_type: str, filename: str) -> str:
+    """
+    Returns the relative path for an asset within a project's storage as a string.
+    """
+    return str(Path(str(project.user_uuid)) / project.slug / 'assets' / asset_type / filename)
+

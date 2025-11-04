@@ -26,6 +26,8 @@ from app_core.utils import (
     projects_to_dict,
     slugify,
 )
+from app_core.data_acquisition import download_srtm_tile, download_mapbiomas_tile
+from app_core.models import CoverageJob, CoverageEngine
 
 
 bp = Blueprint("projects", __name__, url_prefix="/projects")
@@ -347,3 +349,98 @@ def api_delete_project(slug):
         db.session.rollback()
         return jsonify({"error": f"Não foi possível remover o projeto: {exc}"}), 500
     return jsonify({"status": "deleted"})
+
+
+@api_bp.route("/<slug>/data/dem", methods=["POST"])
+@login_required
+def api_acquire_dem(slug):
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    payload = request.get_json(silent=True) or {}
+    lat = payload.get("lat")
+    lon = payload.get("lon")
+
+    if not lat or not lon:
+        return jsonify({"error": "Latitude 'lat' and longitude 'lon' are required."}), 400
+
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Latitude 'lat' and longitude 'lon' must be numbers."}), 400
+
+    asset = download_srtm_tile(project, lat, lon)
+
+    if asset:
+        return jsonify({"asset": _asset_to_dict(asset)}), 201
+    else:
+        return jsonify({"error": "Failed to acquire DEM tile."}), 500
+
+
+@api_bp.route("/<slug>/data/lulc", methods=["POST"])
+@login_required
+def api_acquire_lulc(slug):
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    payload = request.get_json(silent=True) or {}
+    year = payload.get("year")
+
+    if not year:
+        return jsonify({"error": "Year is required."}), 400
+
+    try:
+        year = int(year)
+    except (ValueError, TypeError):
+        return jsonify({"error": "Year must be a number."}), 400
+
+    asset = download_mapbiomas_tile(project, year)
+
+    if asset:
+        return jsonify({"asset": _asset_to_dict(asset)}), 201
+    else:
+        return jsonify({"error": "Failed to acquire LULC tile."}), 500
+
+
+@api_bp.route("/<slug>/jobs", methods=["POST"])
+@login_required
+def api_submit_job(slug):
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    payload = request.get_json(silent=True) or {}
+    engine = payload.get("engine")
+    inputs = payload.get("inputs")
+
+    if not engine or not inputs:
+        return jsonify({"error": "Engine and inputs are required."}), 400
+
+    try:
+        engine_enum = CoverageEngine(engine)
+    except ValueError:
+        return jsonify({"error": f"Invalid engine. Must be one of: {[e.value for e in CoverageEngine]}"}), 400
+
+    job = CoverageJob(
+        project_id=project.id,
+        engine=engine_enum,
+        inputs=inputs,
+    )
+    db.session.add(job)
+    try:
+        db.session.commit()
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        return jsonify({"error": f"Failed to create job: {exc}"}), 500
+
+    # TODO: Trigger background worker here
+
+    response = jsonify({"job": _job_to_dict(job)})
+    response.status_code = 202 # Accepted
+    response.headers["Location"] = url_for("projects_api.api_get_job", slug=slug, job_id=job.id)
+    return response
+
+
+@api_bp.route("/<slug>/jobs/<job_id>", methods=["GET"])
+@login_required
+def api_get_job(slug, job_id):
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    job = CoverageJob.query.filter_by(id=job_id, project_id=project.id).first()
+    if not job:
+        return jsonify({"error": "Job not found."}), 404
+
+    return jsonify({"job": _job_to_dict(job)})

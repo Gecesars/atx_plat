@@ -228,7 +228,9 @@
         </div>
     </aside>
 
-    <div class="map-canvas" id="coverageMapContainer" data-project="{{ project.slug if project else '' }}" data-start-lat="{{ start_coords.lat if start_coords else '' }}" data-start-lng="{{ start_coords.lng if start_coords else '' }}">
+    <div class="map-canvas" id="coverageMapContainer" data-project="{{ project.slug if project else '' }}" data-start-lat="{{ start_coords.lat if start_coords else '' }}"      data-last-coverage-image-url="{{ last_coverage_data.image_url if last_coverage_data and last_coverage_data.image_url else '' }}"
+     data-last-coverage-bounds="{{ last_coverage_data.bounds | tojson if last_coverage_data and last_coverage_data.bounds else '' }}"
+     data-last-colorbar-image-url="{{ last_coverage_data.colorbar_image_url if last_coverage_data and last_coverage_data.colorbar_image_url else '' }}">
         <div id="coverageMap" class="map-container"></div>
         <div id="coverageSpinner" class="map-loading" hidden>
             <div class="coverage-spinner-icon" aria-hidden="true"></div>

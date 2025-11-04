@@ -836,38 +836,48 @@ def calculate_distance():
 @login_required
 def mapa():
     maps_key = get_google_maps_key()
+
     projects = (
         current_user.projects.order_by(Project.created_at.asc()).all()
-        if hasattr(current_user, "projects")
-        else []
+        if hasattr(current_user, "projects") else []
     )
-    project_slug = request.args.get('project')
+
+    project_slug = request.args.get("project")
     active_project = None
 
     if project_slug:
         try:
             active_project = project_by_slug_or_404(project_slug, current_user.uuid)
         except Exception:
-            flash('Projeto não encontrado ou sem acesso.', 'error')
-            return redirect(url_for('projects.list_projects'))
+            flash("Projeto não encontrado ou sem acesso.", "error")
+            return redirect(url_for("projects.list_projects"))
     elif projects:
         active_project = projects[0]
 
+    # Se o usuário não tem posição definida, redireciona para configurar
     if current_user.latitude is None or current_user.longitude is None:
-        flash('Por favor, defina a posição da torre primeiro.', 'error')
+        flash("Por favor, defina a posição da torre primeiro.", "error")
         target_slug = active_project.slug if active_project else (projects[0].slug if projects else None)
         if target_slug:
-            return redirect(url_for('ui.calcular_cobertura', project=target_slug))
-        return redirect(url_for('ui.calcular_cobertura'))
+            return redirect(url_for("ui.calcular_cobertura", project=target_slug))
+        return redirect(url_for("ui.calcular_cobertura"))
 
+    # Coordenadas iniciais: preferir as do projeto (se existirem), senão usar as do usuário
     start_coords = {"lat": current_user.latitude, "lng": current_user.longitude}
+    if active_project and getattr(active_project, "settings", None):
+        project_lat = active_project.settings.get("latitude")
+        project_lng = active_project.settings.get("longitude")
+        if project_lat is not None and project_lng is not None:
+            start_coords = {"lat": project_lat, "lng": project_lng}
+
     return render_template(
-        'mapa.html',
+        "mapa.html",
         start_coords=start_coords,
         maps_api_key=maps_key,
         project=active_project,
         projects=projects,
     )
+
 
 @bp.route('/login', methods=['GET', 'POST'])
 def login():
@@ -3204,7 +3214,96 @@ def calculate_coverage():
 
     receivers = data.get('receivers') or []
 
-    result = _compute_coverage_map(current_user, data)
+    # Prepare overrides from project settings
+    project_overrides = {}
+    if project and project.settings:
+        settings = project.settings
+        if "propagationModel" in settings:
+            project_overrides["propagation_model"] = settings["propagationModel"]
+        if "Total_loss" in settings:
+            project_overrides["total_loss"] = settings["Total_loss"]
+        if "antennaGain" in settings:
+            project_overrides["antenna_gain"] = settings["antennaGain"]
+        if "rxGain" in settings:
+            project_overrides["rx_gain"] = settings["rxGain"]
+        if "transmissionPower" in settings:
+            project_overrides["transmission_power"] = settings["transmissionPower"]
+        if "frequency" in settings:
+            project_overrides["frequencia"] = settings["frequency"]
+        if "towerHeight" in settings:
+            project_overrides["tower_height"] = settings["towerHeight"]
+        if "rxHeight" in settings:
+            project_overrides["rx_height"] = settings["rxHeight"]
+        if "antennaTilt" in settings:
+            project_overrides["antenna_tilt"] = settings["antennaTilt"]
+        if "antennaDirection" in settings:
+            project_overrides["antenna_direction"] = settings["antennaDirection"]
+        if "timePercentage" in settings:
+            project_overrides["time_percentage"] = settings["timePercentage"]
+        if "temperature" in settings:
+            project_overrides["temperature_k"] = settings["temperature"] + 273.15 if settings["temperature"] is not None else None
+        if "pressure" in settings:
+            project_overrides["pressure_hpa"] = settings["pressure"]
+        if "waterDensity" in settings:
+            project_overrides["water_density"] = settings["waterDensity"]
+        if "serviceType" in settings:
+            project_overrides["servico"] = settings["serviceType"]
+        if "polarization" in settings:
+            project_overrides["polarization"] = settings["polarization"]
+        if "p452Version" in settings:
+            project_overrides["p452_version"] = settings["p452Version"]
+        if "latitude" in settings:
+            project_overrides["latitude"] = settings["latitude"]
+        if "longitude" in settings:
+            project_overrides["longitude"] = settings["longitude"]
+
+    # Prepare overrides from request data (real-time UI changes)
+    request_overrides = {}
+    if "latitude" in data:
+        request_overrides["latitude"] = _coerce_float(data["latitude"])
+    if "longitude" in data:
+        request_overrides["longitude"] = _coerce_float(data["longitude"])
+    if "frequency" in data:
+        request_overrides["frequencia"] = _coerce_float(data["frequency"])
+    if "direction" in data:
+        request_overrides["antenna_direction"] = _normalize_direction_value(data["direction"])
+    if "tilt" in data:
+        request_overrides["antenna_tilt"] = _coerce_float(data["tilt"])
+    if "tower_height" in data:
+        request_overrides["tower_height"] = _coerce_float(data["tower_height"])
+    if "rx_height" in data:
+        request_overrides["rx_height"] = _coerce_float(data["rx_height"])
+    if "transmission_power" in data:
+        request_overrides["transmission_power"] = _coerce_float(data["transmission_power"])
+    if "antenna_gain" in data:
+        request_overrides["antenna_gain"] = _coerce_float(data["antenna_gain"])
+    if "total_loss" in data:
+        request_overrides["total_loss"] = _coerce_float(data["total_loss"])
+    if "time_percentage" in data:
+        request_overrides["time_percentage"] = _coerce_float(data["time_percentage"])
+    if "polarization" in data:
+        request_overrides["polarization"] = _coerce_str(data["polarization"])
+    if "p452_version" in data:
+        request_overrides["p452_version"] = _coerce_float(data["p452_version"])
+    if "temperature_k" in data:
+        request_overrides["temperature_k"] = _coerce_float(data["temperature_k"])
+    if "pressure_hpa" in data:
+        request_overrides["pressure_hpa"] = _coerce_float(data["pressure_hpa"])
+    if "water_density" in data:
+        request_overrides["water_density"] = _coerce_float(data["water_density"])
+    if "propagation_model" in data:
+        request_overrides["propagation_model"] = _coerce_str(data["propagation_model"])
+    if "service" in data:
+        request_overrides["servico"] = _coerce_str(data["service"])
+
+    # Combine overrides: request_overrides take precedence over project_overrides
+    # which take precedence over current_user defaults.
+    all_overrides = {**project_overrides, **request_overrides}
+
+    # Construct the tx_object
+    tx_object = _prepare_tx_object(current_user, overrides=all_overrides)
+
+    result = _compute_coverage_map(tx_object, data)
     result['receivers'] = receivers
 
     persisted = None
@@ -3380,13 +3479,18 @@ def visualizar_dados_salvos():
     except Exception:
         projects = []
 
+    requested_slug = request.args.get('project') # Get the project slug from the request
+
     for project in projects:
+        if requested_slug and project.slug != requested_slug:
+            continue
+
         settings = project.settings or {}
         summary = settings.get('lastCoverage')
         asset_id = summary.get('asset_id') if summary else None
         if summary and asset_id:
             try:
-                preview_url = url_for('projects.asset_preview', slug=project.slug, asset_id=asset_id)
+                preview_url = url_for('projects.asset_preview', slug=project.slug, asset_id=asset.id)
             except Exception:
                 preview_url = None
             if preview_url:

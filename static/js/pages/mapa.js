@@ -1337,6 +1337,20 @@ function initCoverageMap() {
             if (state.coverageData) {
                 state.coverageData.project_slug = window.coverageProjectSlug || state.coverageData.project_slug;
                 state.coverageData.engine = state.coverageData.engine || state.txData.coverageEngine || 'p1546';
+                // Explicitly copy all relevant fields from lastCoverage
+                state.coverageData.bounds = state.coverageData.bounds || null;
+                state.coverageData.colorbar_bounds = state.coverageData.colorbar_bounds || null;
+                state.coverageData.scale = state.coverageData.scale || null;
+                state.coverageData.center = state.coverageData.center || null;
+                state.coverageData.requested_radius_km = state.coverageData.requested_radius_km || null;
+                state.coverageData.radius = state.coverageData.radius || null;
+                state.coverageData.gain_components = state.coverageData.gain_components || null;
+                state.coverageData.loss_components = state.coverageData.loss_components || null;
+                state.coverageData.center_metrics = state.coverageData.center_metrics || null;
+                state.coverageData.signal_level_dict = state.coverageData.signal_level_dict || null;
+                state.coverageData.signal_level_dict_dbm = state.coverageData.signal_level_dict_dbm || null;
+                state.coverageData.location_status = state.coverageData.location_status || null;
+
                 if (state.coverageData.center_metrics) {
                     updateCenterSummary(state.coverageData.center_metrics);
                 }

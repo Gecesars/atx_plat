@@ -113,6 +113,12 @@ class Asset(TimestampMixin, db.Model):
         nullable=False,
         index=True,
     )
+    source_id = db.Column(
+        GUID(),
+        db.ForeignKey("dataset_sources.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     type = db.Column(db.Enum(AssetType, name="asset_type"), nullable=False)
     path = db.Column(db.String(512), nullable=False)
     mime_type = db.Column(db.String(128), nullable=True)
@@ -121,6 +127,7 @@ class Asset(TimestampMixin, db.Model):
     meta = db.Column(db.JSON, nullable=True)
 
     project = db.relationship("Project", back_populates="assets")
+    source = db.relationship("DatasetSource", back_populates="assets")
     coverage_jobs = db.relationship(
         "CoverageJob",
         back_populates="output_asset",
@@ -128,6 +135,10 @@ class Asset(TimestampMixin, db.Model):
         passive_deletes=True,
         lazy="dynamic",
     )
+
+    def get_full_path(self):
+        from flask import current_app
+        return current_app.config['STORAGE_ROOT'] / self.path
 
 
 class CoverageJob(TimestampMixin, db.Model):
@@ -207,6 +218,9 @@ class DatasetSource(TimestampMixin, db.Model):
     notes = db.Column(db.Text(), nullable=True)
 
     project = db.relationship("Project", back_populates="dataset_sources")
+    assets = db.relationship(
+        "Asset", back_populates="source", cascade="all, delete-orphan"
+    )
 
 
 @event.listens_for(Project, "before_insert", propagate=True)

@@ -37,34 +37,41 @@
             <h5 class="mb-0">Últimas manchas de cobertura</h5>
             <small class="text-muted">As imagens são vinculadas automaticamente aos projetos correspondentes.</small>
         </div>
-        {% if coverage_cards %}
-            <div class="row g-4">
-                {% for card in coverage_cards %}
-                <div class="col-md-6 col-xl-4">
-                    <div class="card h-100 shadow-sm">
+        <div class="row g-4">
+            {% for card in coverage_cards %}
+            <div class="col-md-6 col-xl-4">
+                <div class="card h-100 shadow-sm">
+                    {% if card.preview_url %}
                         <img src="{{ card.preview_url }}" class="card-img-top" alt="Prévia da cobertura">
-                        <div class="card-body d-flex flex-column">
-                            <h6 class="card-title mb-1">{{ card.project.name }}</h6>
-                            <p class="text-muted small mb-2">Gerada em {{ card.generated_at }} · Motor {{ card.engine|upper }}</p>
-                            {% set center_metrics = card.center_metrics %}
-                            {% if center_metrics %}
-                                <ul class="list-unstyled small text-muted mb-3">
-                                    <li><strong>Campo no centro:</strong> {{ center_metrics.field_center_dbuv_m|round(2) if center_metrics.field_center_dbuv_m is not none else '—' }} dBµV/m</li>
-                                    <li><strong>Potência RX:</strong> {{ center_metrics.received_power_center_dbm|round(2) if center_metrics.received_power_center_dbm is not none else '—' }} dBm</li>
-                                </ul>
-                            {% endif %}
-                            <div class="mt-auto d-flex gap-2">
-                                <a class="btn btn-sm btn-brand flex-grow-1" href="{{ card.detail_url }}">Abrir projeto</a>
+                    {% endif %}
+                    <div class="card-body d-flex flex-column">
+                        <h6 class="card-title mb-1">{{ card.project.name }}</h6>
+                        <p class="text-muted small mb-2">
+                            {% if card.generated_at %}Gerada em {{ card.generated_at }}{% else %}Sem data registrada{% endif %}
+                            {% if card.engine %} · Motor {{ card.engine|upper }}{% endif %}
+                        </p>
+                        {% set center_metrics = card.center_metrics %}
+                        {% if center_metrics %}
+                            <ul class="list-unstyled small text-muted mb-3">
+                                <li><strong>Campo no centro:</strong> {{ center_metrics.field_center_dbuv_m|round(2) if center_metrics.field_center_dbuv_m is not none else '—' }} dBµV/m</li>
+                                <li><strong>Potência RX:</strong> {{ center_metrics.received_power_center_dbm|round(2) if center_metrics.received_power_center_dbm is not none else '—' }} dBm</li>
+                            </ul>
+                        {% endif %}
+                        <div class="mt-auto d-flex gap-2">
+                            <a class="btn btn-sm btn-brand flex-grow-1" href="{{ card.detail_url }}">Abrir projeto</a>
+                            {% if card.preview_url %}
                                 <a class="btn btn-sm btn-outline-secondary" href="{{ card.preview_url }}" target="_blank">Ver imagem</a>
-                            </div>
+                            {% endif %}
                         </div>
                     </div>
                 </div>
-                {% endfor %}
             </div>
-        {% else %}
-            <div class="alert alert-info">Nenhuma cobertura foi gerada ainda. Utilize a aba <em>Planejar cobertura</em> para produzir a primeira mancha.</div>
-        {% endif %}
+            {% else %}
+            <div class="col-12">
+                <div class="alert alert-info">Nenhuma cobertura foi gerada ainda. Utilize a aba <em>Planejar cobertura</em> para produzir a primeira mancha.</div>
+            </div>
+            {% endfor %}
+        </div>
     </section>
 
     <section class="mb-4">

@@ -344,11 +344,11 @@
             const response = await axios.post(url, payload);
             const data = response.data || {};
             const isGenerate = mode === 'generate';
-            notify(
-                isGenerate ? 'Parâmetros salvos. Iniciando geração da cobertura...' : 'Parâmetros salvos com sucesso.',
-                isGenerate ? 'info' : 'success',
-                isGenerate ? 2000 : 4000,
-            );
+            const successMessage = data.message
+                || (isGenerate
+                    ? 'Parâmetros salvos. Iniciando geração da cobertura...'
+                    : 'Parâmetros salvos com sucesso.');
+            notify(successMessage, isGenerate ? 'info' : 'success', isGenerate ? 2000 : 4000);
 
             if (data.projectSettings && data.projectSettings.lastSavedAt) {
                 updateLastSaved(data.projectSettings.lastSavedAt);
@@ -359,9 +359,13 @@
             }
         } catch (error) {
             console.error(error);
-            const message = mode === 'generate'
-                ? (error?.message || 'Falha ao gerar a cobertura.')
+            const fallback = mode === 'generate'
+                ? 'Falha ao gerar a cobertura.'
                 : 'Não foi possível salvar os parâmetros.';
+            const message = error?.response?.data?.message
+                || error?.response?.data?.detail
+                || error?.message
+                || fallback;
             notify(message, 'danger');
         } finally {
             if (targetButton) {
@@ -641,6 +645,20 @@
         const loadClimateBtn = document.getElementById('loadClimateBtn');
         if (loadClimateBtn) {
             loadClimateBtn.addEventListener('click', carregarClimaPadrao);
+        }
+
+        const openCoverageMapBtn = document.getElementById('openCoverageMapBtn');
+        if (openCoverageMapBtn) {
+            openCoverageMapBtn.addEventListener('click', (event) => {
+                event.preventDefault();
+                if (!state.projectSlug) {
+                    notify('Selecione um projeto antes de abrir o mapa.', 'warning');
+                    return;
+                }
+                const baseUrl = openCoverageMapBtn.dataset.mapUrl || '/mapa';
+                const params = new URLSearchParams({ project: state.projectSlug });
+                window.location.href = `${baseUrl}?${params.toString()}`;
+            });
         }
 
         if (backButton) {

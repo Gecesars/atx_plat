@@ -316,8 +316,8 @@
                 <div class="coverage-actions d-flex flex-wrap gap-2 justify-content-end mt-4">
                     <button type="button" class="btn btn-outline-secondary" id="saveCoverageBtn">Salvar parâmetros</button>
                     <button type="button" class="btn btn-brand" id="generateCoverageButton" disabled>Gerar cobertura</button>
-                    <button type="button" class="btn btn-outline-secondary" onclick="window.location.href='{{ url_for('ui.visualizar_dados_salvos') }}'">Visualizar dados salvos</button>
-                    <button type="button" class="btn btn-outline-primary" onclick="window.location.href='{{ url_for('ui.mapa') }}'">Abrir mapa de cobertura</button>
+                    <button type="button" class="btn btn-outline-secondary" onclick="window.location.href='{{ url_for('ui.visualizar_dados_salvos', project=project.slug) if project else url_for('ui.visualizar_dados_salvos') }}'">Visualizar dados salvos</button>
+                    <a class="btn btn-outline-primary" id="openCoverageMapBtn" href="{{ url_for('ui.mapa', project=project.slug) if project else url_for('ui.mapa') }}" data-map-url="{{ url_for('ui.mapa') }}">Abrir mapa de cobertura</a>
                     <button type="button" class="btn btn-outline-secondary" id="backToHomeBtn">Voltar ao painel</button>
                 </div>
             </form>

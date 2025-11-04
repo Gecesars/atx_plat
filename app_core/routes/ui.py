@@ -689,7 +689,21 @@ def calcular_cobertura():
             if projects:
                 active_project = projects[0]
     elif projects:
-        active_project = projects[0]
+        def _coverage_sort_key(proj: Project):
+            settings = proj.settings or {}
+            coverage = settings.get('lastCoverage') or {}
+            generated = coverage.get('generated_at')
+            if generated:
+                try:
+                    return datetime.fromisoformat(generated)
+                except ValueError:
+                    pass
+            return proj.created_at or datetime.min
+
+        try:
+            active_project = max(projects, key=_coverage_sort_key)
+        except ValueError:
+            active_project = projects[0]
 
     if requested_slug and not active_project:
         # slug informado mas nenhum projeto encontrado
@@ -2348,6 +2362,7 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
     summary_payload = {
         "engine": engine_enum.value,
         "generated_at": timestamp_iso,
+        "project_slug": project.slug,
         "request": _clean_json(request_payload),
         "center_metrics": _clean_json(coverage_payload.get('center_metrics')),
         "loss_components": _clean_json(coverage_payload.get('loss_components')),
@@ -2364,8 +2379,6 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "location_status": coverage_payload.get('location_status'),
         "receivers": _clean_json(receivers_payload),
     }
-    json_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2, default=_json_default))
-
     heatmap_asset = Asset(
         project_id=project.id,
         type=AssetType.heatmap,
@@ -2412,6 +2425,16 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
 
     db.session.flush()
 
+    summary_payload.update({
+        "asset_id": str(heatmap_asset.id),
+        "asset_path": heatmap_asset.path,
+        "json_asset_id": str(json_asset.id),
+    })
+    if colorbar_asset:
+        summary_payload["colorbar_asset_id"] = str(colorbar_asset.id)
+
+    json_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2, default=_json_default))
+
     job = CoverageJob(
         project_id=project.id,
         status=CoverageStatus.succeeded,
@@ -2423,6 +2446,7 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         metrics={
             "center_metrics": _clean_json(coverage_payload.get('center_metrics')),
             "loss_components": _clean_json(coverage_payload.get('loss_components')),
+            "summary": _clean_json(summary_payload),
         },
         outputs_asset_id=heatmap_asset.id,
         started_at=timestamp,
@@ -2435,6 +2459,7 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
     last_coverage = {
         "generated_at": timestamp_iso,
         "engine": engine_enum.value,
+        "project_slug": project.slug,
         "asset_id": str(heatmap_asset.id),
         "asset_path": heatmap_asset.path,
         "json_asset_id": str(json_asset.id),
@@ -2462,6 +2487,70 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "job": job,
         "timestamp": timestamp_iso,
     }
+
+
+def _latest_coverage_snapshot(project: Project | None):
+    if project is None:
+        return None
+
+    job = (
+        CoverageJob.query
+        .filter_by(project_id=project.id, status=CoverageStatus.succeeded)
+        .order_by(
+            CoverageJob.finished_at.desc().nullslast(),
+            CoverageJob.started_at.desc().nullslast(),
+            CoverageJob.created_at.desc().nullslast(),
+        )
+        .first()
+    )
+
+    settings_snapshot = (project.settings or {}).get('lastCoverage') or {}
+
+    if not job:
+        if settings_snapshot:
+            snapshot = dict(settings_snapshot)
+            snapshot.setdefault('project_slug', project.slug)
+            return snapshot
+        return None
+
+    metrics = job.metrics or {}
+    summary = dict(metrics.get('summary') or {})
+
+    for key, value in settings_snapshot.items():
+        summary.setdefault(key, value)
+
+    asset = None
+    if job.outputs_asset_id:
+        asset = Asset.query.filter_by(id=job.outputs_asset_id, project_id=project.id).first()
+
+    if not asset:
+        return None
+
+    summary['asset_id'] = str(summary.get('asset_id') or asset.id)
+    summary['asset_path'] = summary.get('asset_path') or asset.path
+    summary['engine'] = summary.get('engine') or (job.engine.value if job.engine else None)
+    summary['generated_at'] = summary.get('generated_at') or (
+        job.finished_at.isoformat() if job.finished_at else (
+            job.started_at.isoformat() if job.started_at else None
+        )
+    )
+    summary['project_slug'] = project.slug
+
+    if summary.get('json_asset_id') is not None:
+        summary['json_asset_id'] = str(summary['json_asset_id'])
+    if summary.get('colorbar_asset_id') is not None:
+        summary['colorbar_asset_id'] = str(summary['colorbar_asset_id'])
+
+    summary.setdefault('center_metrics', metrics.get('center_metrics'))
+    summary.setdefault('loss_components', metrics.get('loss_components'))
+    summary.setdefault('scale', summary.get('scale'))
+    summary.setdefault('bounds', summary.get('bounds'))
+    if 'center' not in summary or summary['center'] is None:
+        summary['center'] = summary.get('tx_location')
+    summary.setdefault('requested_radius_km', summary.get('requested_radius_km') or summary.get('radius_km'))
+    summary.setdefault('receivers', summary.get('receivers') or [])
+
+    return summary
 def _compute_coverage_map(tx, data, include_arrays=False, label=None):
     """
     Gera todos os artefatos de cobertura (heatmap, barra de cores, metadados)
@@ -3305,6 +3394,8 @@ def calculate_coverage():
 
     result = _compute_coverage_map(tx_object, data)
     result['receivers'] = receivers
+    if project:
+        result.setdefault('project_slug', project.slug)
 
     persisted = None
     try:
@@ -3333,7 +3424,9 @@ def calculate_coverage():
             result['generated_at'] = persisted['timestamp']
             if project:
                 result['project_slug'] = project.slug
-                result['lastCoverage'] = (project.settings or {}).get('lastCoverage')
+                result['lastCoverage'] = _latest_coverage_snapshot(project)
+        elif project:
+            result['lastCoverage'] = _latest_coverage_snapshot(project)
 
     return jsonify(result)
 
@@ -3485,21 +3578,20 @@ def visualizar_dados_salvos():
         if requested_slug and project.slug != requested_slug:
             continue
 
-        settings = project.settings or {}
-        summary = settings.get('lastCoverage')
-        asset_id = summary.get('asset_id') if summary else None
-        if summary and asset_id:
+        snapshot = _latest_coverage_snapshot(project)
+        asset_id = snapshot.get('asset_id') if snapshot else None
+        if snapshot and asset_id:
             try:
-                preview_url = url_for('projects.asset_preview', slug=project.slug, asset_id=asset.id)
+                preview_url = url_for('projects.asset_preview', slug=project.slug, asset_id=asset_id)
             except Exception:
                 preview_url = None
             if preview_url:
                 coverage_cards.append({
                     'project': project,
-                    'engine': summary.get('engine'),
-                    'generated_at': summary.get('generated_at'),
-                    'radius_km': summary.get('radius_km'),
-                    'center_metrics': summary.get('center_metrics'),
+                    'engine': snapshot.get('engine'),
+                    'generated_at': snapshot.get('generated_at'),
+                    'radius_km': snapshot.get('radius_km') or snapshot.get('requested_radius_km'),
+                    'center_metrics': snapshot.get('center_metrics'),
                     'preview_url': preview_url,
                     'detail_url': url_for('projects.view_project', slug=project.slug),
                 })
@@ -3554,7 +3646,11 @@ def carregar_dados():
         project_settings = {}
         if project_slug:
             project = project_by_slug_or_404(project_slug, current_user.uuid)
-            project_settings = project.settings or {}
+            project_settings = dict(project.settings or {})
+        else:
+            project_settings = {}
+
+        latest_snapshot = _latest_coverage_snapshot(project) if project else None
 
         user_data = {
             'username': user.username,
@@ -3587,18 +3683,34 @@ def carregar_dados():
             'coverageEngine': CoverageEngine.p1546.value,
         }
 
+        for key, value in project_settings.items():
+            if value is not None:
+                user_data[key] = value
+
+        if latest_snapshot:
+            project_settings['lastCoverage'] = latest_snapshot
+            if latest_snapshot.get('engine'):
+                user_data['coverageEngine'] = latest_snapshot['engine']
+            center = latest_snapshot.get('center') or latest_snapshot.get('tx_location')
+            if center and user_data.get('latitude') is None:
+                user_data['latitude'] = center.get('lat')
+            if center and user_data.get('longitude') is None:
+                user_data['longitude'] = center.get('lng')
+
         if project_settings:
-            for key, value in project_settings.items():
-                if value is not None:
-                    user_data[key] = value
-            user_data['coverageEngine'] = project_settings.get('coverageEngine', CoverageEngine.p1546.value)
+            user_data['coverageEngine'] = project_settings.get('coverageEngine', user_data['coverageEngine'])
             user_data['projectSettings'] = project_settings
+        else:
+            user_data['projectSettings'] = {}
+
         if project:
             user_data['projectSlug'] = project.slug
             user_data['projectName'] = project.name
             user_data['projectDescription'] = project.description
             if project_settings.get('lastSavedAt'):
                 user_data['projectLastSavedAt'] = project_settings.get('lastSavedAt')
+            if latest_snapshot:
+                user_data['lastCoverage'] = latest_snapshot
 
         return jsonify(user_data), 200
     except Exception as e:

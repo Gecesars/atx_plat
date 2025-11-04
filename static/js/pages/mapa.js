@@ -518,7 +518,13 @@ async function loadCoverageOverlay(lastCoverage) {
         throw new Error('Projeto não informado para restaurar a cobertura.');
     }
 
-    const slug = window.coverageProjectSlug;
+    let slug = lastCoverage.project_slug
+        || lastCoverage.projectSlug
+        || window.coverageProjectSlug
+        || null;
+    if (!slug) {
+        throw new Error('Projeto não definido para restaurar a cobertura.');
+    }
     const summaryId = lastCoverage.json_asset_id;
     let summary = null;
 
@@ -530,10 +536,16 @@ async function loadCoverageOverlay(lastCoverage) {
             );
             if (summaryResponse.ok) {
                 summary = await summaryResponse.json();
+                if (!slug && summary?.project_slug) {
+                    slug = summary.project_slug;
+                }
             }
         } catch (error) {
             console.warn('Falha ao carregar resumo da cobertura.', error);
         }
+    }
+    if (!slug && summary?.project_slug) {
+        slug = summary.project_slug;
     }
 
     const heatmapResponse = await fetch(
@@ -614,7 +626,7 @@ async function loadCoverageOverlay(lastCoverage) {
     state.coverageData.receivers = coveragePayload.receivers;
     state.coverageData.signal_level_dict = coveragePayload.signal_level_dict;
     state.coverageData.signal_level_dict_dbm = coveragePayload.signal_level_dict_dbm;
-    state.coverageData.project_slug = window.coverageProjectSlug || state.coverageData.project_slug;
+    state.coverageData.project_slug = slug;
 
     if (state.txData) {
         state.txData.location_status = coveragePayload.location_status || state.txData.location_status;
@@ -1323,27 +1335,55 @@ function initCoverageMap() {
     fetch(`/carregar-dados?${params.toString()}`)
         .then((response) => response.json())
         .then((data) => {
+            const projectSettings = data.projectSettings || {};
+            const lastCoverage = projectSettings.lastCoverage || {};
+
+            let slugCandidate = data.projectSlug
+                || projectSettings.slug
+                || lastCoverage.project_slug
+                || window.coverageProjectSlug
+                || container?.dataset.project
+                || null;
+            if (slugCandidate) {
+                window.coverageProjectSlug = slugCandidate;
+            }
+
+            const storedLat = parseNullableNumber(projectSettings.latitude);
+            const storedLng = parseNullableNumber(projectSettings.longitude);
+
+            const coverageCenter = lastCoverage.center || lastCoverage.tx_location || null;
+            const coverageLat = parseNullableNumber(coverageCenter?.lat ?? coverageCenter?.latitude);
+            const coverageLng = parseNullableNumber(coverageCenter?.lng ?? coverageCenter?.longitude);
+
+            const dataLat = parseNullableNumber(data.latitude);
+            const dataLng = parseNullableNumber(data.longitude);
+            const containerLat = container ? parseNullableNumber(container.dataset.startLat) : null;
+            const containerLng = container ? parseNullableNumber(container.dataset.startLng) : null;
+
+            const finalLat = storedLat ?? coverageLat ?? dataLat ?? containerLat ?? 0;
+            const finalLng = storedLng ?? coverageLng ?? dataLng ?? containerLng ?? 0;
+
             state.txData = { ...data };
             state.txData.coverageEngine = data.coverageEngine || data.coverage_engine || state.txData.coverageEngine;
             state.txData.txElevation = data.txElevation ?? data.tx_site_elevation ?? state.txData.txElevation;
             state.txData.txLocationName = data.txLocationName || data.tx_location_name || data.municipality || state.txData.txLocationName;
-            if (data.projectSettings?.lastCoverage?.location_status) {
-                state.txData.location_status = data.projectSettings.lastCoverage.location_status;
+            state.txData.latitude = finalLat;
+            state.txData.longitude = finalLng;
+            if (lastCoverage.location_status) {
+                state.txData.location_status = lastCoverage.location_status;
             }
 
-            state.coverageData = data.projectSettings?.lastCoverage
-                ? { ...data.projectSettings.lastCoverage }
+            state.coverageData = lastCoverage.project_slug || lastCoverage.asset_id
+                ? { ...lastCoverage, project_slug: lastCoverage.project_slug || slugCandidate }
                 : null;
             if (state.coverageData) {
-                state.coverageData.project_slug = window.coverageProjectSlug || state.coverageData.project_slug;
                 state.coverageData.engine = state.coverageData.engine || state.txData.coverageEngine || 'p1546';
-                // Explicitly copy all relevant fields from lastCoverage
                 state.coverageData.bounds = state.coverageData.bounds || null;
                 state.coverageData.colorbar_bounds = state.coverageData.colorbar_bounds || null;
                 state.coverageData.scale = state.coverageData.scale || null;
-                state.coverageData.center = state.coverageData.center || null;
-                state.coverageData.requested_radius_km = state.coverageData.requested_radius_km || null;
-                state.coverageData.radius = state.coverageData.radius || null;
+                state.coverageData.center = state.coverageData.center || coverageCenter || null;
+                state.coverageData.requested_radius_km = state.coverageData.requested_radius_km || state.coverageData.radius_km || null;
+                state.coverageData.radius = state.coverageData.radius || state.coverageData.radius_km || null;
                 state.coverageData.gain_components = state.coverageData.gain_components || null;
                 state.coverageData.loss_components = state.coverageData.loss_components || null;
                 state.coverageData.center_metrics = state.coverageData.center_metrics || null;
@@ -1369,34 +1409,8 @@ function initCoverageMap() {
                 }
             }
 
-            if (!window.coverageProjectSlug) {
-                if (data.projectSlug) {
-                    window.coverageProjectSlug = data.projectSlug;
-                } else if (state.coverageData?.project_slug) {
-                    window.coverageProjectSlug = state.coverageData.project_slug;
-                }
-            }
-
-            const lat = parseNullableNumber(data.latitude);
-            const lng = parseNullableNumber(data.longitude);
-            const fallbackLat = container ? parseNullableNumber(container.dataset.startLat) : null;
-            const fallbackLng = container ? parseNullableNumber(container.dataset.startLng) : null;
-            const txLatLng = (Number.isFinite(lat) && Number.isFinite(lng))
-                ? new google.maps.LatLng(lat, lng)
-                : (Number.isFinite(fallbackLat) && Number.isFinite(fallbackLng)
-                    ? new google.maps.LatLng(fallbackLat, fallbackLng)
-                    : new google.maps.LatLng(0, 0));
+            const txLatLng = new google.maps.LatLng(finalLat, finalLng);
             state.txCoords = txLatLng;
-            if (Number.isFinite(lat)) {
-                state.txData.latitude = lat;
-            } else if (Number.isFinite(fallbackLat)) {
-                state.txData.latitude = fallbackLat;
-            }
-            if (Number.isFinite(lng)) {
-                state.txData.longitude = lng;
-            } else if (Number.isFinite(fallbackLng)) {
-                state.txData.longitude = fallbackLng;
-            }
 
             updateTxSummary(state.txData);
 

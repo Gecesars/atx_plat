@@ -65,6 +65,7 @@ from app_core.models import (
 )
 from app_core.email_utils import generate_token, load_token, send_email
 from app_core.storage import ensure_storage_structure, storage_root
+from app_core.data_acquisition import ensure_geodata_availability, global_srtm_dir
 from app_core.utils import (
     ensure_unique_slug,
     project_by_slug_or_404,
@@ -1525,6 +1526,10 @@ def gerar_img_perfil():
     start_coords = data['path'][0]
     end_coords   = data['path'][1]
     path = data['path']
+    project_slug = data.get('projectSlug') or data.get('project_slug')
+    project = None
+    if project_slug:
+        project = project_by_slug_or_404(project_slug, current_user.uuid)
 
     # ========= parâmetros TX/RX =========
     Ptx_W         = max(float(current_user.transmission_power or 0.0), 1e-6)  # W
@@ -1605,12 +1610,53 @@ def gerar_img_perfil():
     time_percent  = 40.0 * u.percent
     zone_t, zone_r = pathprof.CLUTTER.UNKNOWN, pathprof.CLUTTER.UNKNOWN
 
-    with SrtmConf.set(srtm_dir='./SRTM', download='missing', server='viewpano'):
-        profile = pathprof.srtm_height_profile(
-            lon_tx, lat_tx,
-            lon_rx, lat_rx,
-            step=1 * u.m
+    srtm_dir = str(global_srtm_dir())
+    if project:
+        summary_tx = ensure_geodata_availability(project, start_coords['lat'], start_coords['lng'], fetch_lulc=False)
+        summary_rx = ensure_geodata_availability(project, end_coords['lat'], end_coords['lng'], fetch_lulc=False)
+        srtm_dir = (summary_rx.get('dem_dir') or summary_tx.get('dem_dir')) or srtm_dir
+    using_google_profile = False
+    message_payload = None
+    google_profile = _google_elevation_profile(tx_coords, rx_coords, samples=256)
+    if google_profile:
+        using_google_profile = True
+        current_app.logger.info(
+            'elevation.profile.using_google',
+            extra={
+                'samples': google_profile.get('samples'),
+                'distance_km': google_profile['distance_m'] / 1000.0,
+            },
         )
+        elevations = np.array(google_profile['elevations_m'], dtype=float)
+        total_distance = google_profile['distance_m']
+        sample_count = len(elevations)
+        distance_samples = np.linspace(0.0, total_distance, sample_count)
+        distances = (distance_samples * u.m)
+        heights = (elevations * u.m)
+        longitudes = np.array(google_profile['longitudes'])
+        latitudes = np.array(google_profile['latitudes'])
+        additional_data = {}
+    else:
+        message_payload = {
+            "message": "Perfil usando SRTM local — aguarde alguns segundos a mais.",
+            "warning": True,
+        }
+        current_app.logger.info('elevation.profile.using_srtm')
+        profile_step = 30 * u.m  # SRTM1 tem resolução ≈30 m; evita amostragem excessiva
+        try:
+            with SrtmConf.set(srtm_dir=srtm_dir, download='none', server='viewpano'):
+                profile = pathprof.srtm_height_profile(
+                    lon_tx, lat_tx,
+                    lon_rx, lat_rx,
+                    step=profile_step
+                )
+        except Exception:
+            with SrtmConf.set(srtm_dir=srtm_dir, download='missing', server='viewpano'):
+                profile = pathprof.srtm_height_profile(
+                    lon_tx, lat_tx,
+                    lon_rx, lat_rx,
+                    step=profile_step
+                )
         longitudes, latitudes, total_distance, distances, heights, angle1, angle2, additional_data = profile
 
     # alturas das antenas acima do solo
@@ -1633,37 +1679,37 @@ def gerar_img_perfil():
     # raio efetivo da Terra (k-factor). Guardamos pra uso futuro se quiser plotar info.
     effective_radius = calculate_effective_earth_radius()
 
-    # ========= perdas ITU-R P.452 no enlace ponto-a-ponto =========
-    results = pathprof.losses_complete(
-        frequency,
-        temperature,
-        pressure,
-        lon_tx, lat_tx,
-        lon_rx, lat_rx,
-        h_tg, h_rg,
-        1 * u.m,
-        time_percent,
-        zone_t=zone_t,
-        zone_r=zone_r,
-    )
-
     # distância total TX→RX
     rx_position_km = distances.to(u.km)[-1].value
 
-    # tentar ler L_b_corr se existir, senão L_b
-    _Lb_corr_obj = results.get('L_b_corr', None)
-    if _Lb_corr_obj is None:
-        _Lb_corr_obj = results.get('L_b', None)
-
-    if hasattr(_Lb_corr_obj, 'value'):
-        val = _Lb_corr_obj.value
-        if isinstance(val, np.ndarray):
-            Lb_corr = float(val[0])
-        else:
-            Lb_corr = float(val)
+    if using_google_profile:
+        Lb_corr = _estimate_fspl_loss(freq_mhz_user, rx_position_km)
+        results = None
     else:
-        # fallback bruto
-        Lb_corr = float(_Lb_corr_obj)
+        results = pathprof.losses_complete(
+            frequency,
+            temperature,
+            pressure,
+            lon_tx, lat_tx,
+            lon_rx, lat_rx,
+            h_tg, h_rg,
+            1 * u.m,
+            time_percent,
+            zone_t=zone_t,
+            zone_r=zone_r,
+        )
+        _Lb_corr_obj = results.get('L_b_corr', None)
+        if _Lb_corr_obj is None:
+            _Lb_corr_obj = results.get('L_b', None)
+
+        if hasattr(_Lb_corr_obj, 'value'):
+            val = _Lb_corr_obj.value
+            if isinstance(val, np.ndarray):
+                Lb_corr = float(val[0])
+            else:
+                Lb_corr = float(val)
+        else:
+            Lb_corr = float(_Lb_corr_obj)
 
     # potência recebida estimada em dBm no RX:
     # Prx = ERP(dBm) + G_rx(dBi) - L_path(dB)
@@ -1966,7 +2012,7 @@ def gerar_img_perfil():
     img_buffer.close()
     plt.close(fig)
 
-    return jsonify({
+    response_payload = {
         "image": img_base64,
         "info": info_lines,
         "distance_km": rx_position_km,
@@ -1974,7 +2020,11 @@ def gerar_img_perfil():
         "rx_power_dbm": sinal_recebido,
         "rx_field_dbuvm": field_rx_dbuv,
         "obstacles": obstacle_desc,
-    })
+    }
+    if message_payload:
+        response_payload.update(message_payload)
+
+    return jsonify(response_payload)
 
 
 
@@ -2173,14 +2223,26 @@ def _select_map_resolution(radius_km, min_arcsec=0.5, max_arcsec=20.0):
 
 def _compute_site_elevation(lat, lon):
     try:
-        with pathprof.SrtmConf.set(srtm_dir='./SRTM', download='missing', server='viewpano'):
-            _, _, height_map = pathprof.srtm_height_map(
-                lon * u.deg,
-                lat * u.deg,
-                0.02 * u.deg,
-                0.02 * u.deg,
-                map_resolution=3 * u.arcsec,
-            )
+        srtm_dir = str(global_srtm_dir())
+        download_mode = 'none'
+        try:
+            with pathprof.SrtmConf.set(srtm_dir=srtm_dir, download=download_mode, server='viewpano'):
+                _, _, height_map = pathprof.srtm_height_map(
+                    lon * u.deg,
+                    lat * u.deg,
+                    0.02 * u.deg,
+                    0.02 * u.deg,
+                    map_resolution=3 * u.arcsec,
+                )
+        except Exception:
+            with pathprof.SrtmConf.set(srtm_dir=srtm_dir, download='missing', server='viewpano'):
+                _, _, height_map = pathprof.srtm_height_map(
+                    lon * u.deg,
+                    lat * u.deg,
+                    0.02 * u.deg,
+                    0.02 * u.deg,
+                    map_resolution=3 * u.arcsec,
+                )
         hm = np.asarray(height_map.to(u.m).value, dtype=float)
         if hm.size == 0:
             return None
@@ -2192,28 +2254,142 @@ def _compute_site_elevation(lat, lon):
 
 
 def _lookup_municipality(lat, lon):
-    try:
-        resp = requests.get(
+    def _format(parts):
+        return ', '.join([part for part in parts if part]) or None
+
+    providers = (
+        (
+            'open-meteo',
             'https://geocoding-api.open-meteo.com/v1/reverse',
-            params={
+            {
                 'latitude': lat,
                 'longitude': lon,
                 'count': 1,
                 'language': 'pt',
                 'format': 'json',
             },
-            timeout=15,
+            {},
+        ),
+        (
+            'osm-nominatim',
+            'https://nominatim.openstreetmap.org/reverse',
+            {
+                'lat': lat,
+                'lon': lon,
+                'format': 'jsonv2',
+                'accept-language': 'pt-BR',
+            },
+            {'headers': {'User-Agent': 'ATXCoverage/1.0'}},
+        ),
+    )
+
+    for provider, url, params, extra in providers:
+        try:
+            resp = requests.get(url, params=params, timeout=15, **extra)
+            resp.raise_for_status()
+            data = resp.json()
+            if provider == 'open-meteo':
+                results = data.get('results') or []
+                if not results:
+                    continue
+                item = results[0]
+                parts = [item.get('name'), item.get('admin1'), item.get('country')]
+                formatted = _format(parts)
+            else:
+                address = data.get('address') or {}
+                parts = [
+                    address.get('city') or address.get('town') or address.get('village') or address.get('municipality'),
+                    address.get('state'),
+                    address.get('country'),
+                ]
+                formatted = _format(parts)
+            if formatted:
+                return formatted
+        except Exception as exc:
+            current_app.logger.warning('Geocoding provider %s falhou: %s', provider, exc)
+            continue
+    return None
+
+
+def _estimate_fspl_loss(frequency_mhz: float, distance_km: float) -> float:
+    distance_km = max(distance_km, 0.001)
+    frequency_mhz = max(frequency_mhz, 0.1)
+    return 32.45 + 20.0 * math.log10(distance_km) + 20.0 * math.log10(frequency_mhz)
+
+
+def _google_elevation_profile(start_coords, end_coords, samples=256):
+    """
+    Usa a Google Elevation API para obter o perfil de terreno ao longo
+    do enlace TX→RX. Retorna None em caso de falha (para permitir fallback SRTM).
+    """
+    api_key = current_app.config.get('GOOGLE_MAPS_API_KEY')
+    if not api_key:
+        return None
+    distance_km = geodesic(
+        (start_coords['lat'], start_coords['lng']),
+        (end_coords['lat'], end_coords['lng']),
+    ).km
+    samples = int(np.clip(distance_km * 10 + 50, 48, 512))
+    params = {
+        'path': f"{start_coords['lat']},{start_coords['lng']}|{end_coords['lat']},{end_coords['lng']}",
+        'samples': samples,
+        'key': api_key,
+    }
+    logger = current_app.logger
+    try:
+        logger.info(
+            'elevation.google.request',
+            extra={
+                'samples': samples,
+                'start': start_coords,
+                'end': end_coords,
+                'distance_km': distance_km,
+            },
         )
+        resp = requests.get('https://maps.googleapis.com/maps/api/elevation/json', params=params, timeout=20)
+        raw_text = resp.text
         resp.raise_for_status()
-        results = resp.json().get('results') or []
-        if not results:
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            logger.warning(
+                'elevation.google.json_error: %s (body=%s)',
+                exc,
+                raw_text[:512],
+            )
             return None
-        item = results[0]
-        parts = [item.get('name'), item.get('admin1'), item.get('country')]
-        formatted = ', '.join([p for p in parts if p])
-        return formatted or None
+        if payload.get('status') != 'OK':
+            logger.warning(
+                'elevation.google.status_not_ok: %s (body=%s)',
+                payload.get('status'),
+                payload,
+            )
+            return None
+        results = payload.get('results') or []
+        if len(results) < 2:
+            return None
+        elevations = [float(item.get('elevation', 0.0)) for item in results]
+        locations = [item.get('location') for item in results]
+        if not all(locations):
+            return None
+        total_distance_m = distance_km * 1000.0
+        lats = [loc.get('lat') for loc in locations]
+        lngs = [loc.get('lng') for loc in locations]
+        sample_count = len(elevations)
+        logger.info('elevation.google.success', extra={'samples': sample_count, 'distance_km': total_distance_m / 1000.0})
+        return {
+            'elevations_m': elevations,
+            'latitudes': lats,
+            'longitudes': lngs,
+            'distance_m': total_distance_m,
+            'samples': sample_count,
+        }
     except Exception as exc:
-        current_app.logger.warning('Falha na geocodificação reversa: %s', exc)
+        logger.warning(
+            'elevation.google.error: %s',
+            exc,
+            exc_info=True,
+        )
         return None
 
 
@@ -2377,6 +2553,9 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "signal_level_dict": _clean_json(coverage_payload.get('signal_level_dict')),
         "signal_level_dict_dbm": _clean_json(coverage_payload.get('signal_level_dict_dbm')),
         "location_status": coverage_payload.get('location_status'),
+        "tx_location_name": coverage_payload.get('tx_location_name'),
+        "tx_site_elevation": coverage_payload.get('tx_site_elevation'),
+        "tx_parameters": _clean_json(coverage_payload.get('tx_parameters')),
         "receivers": _clean_json(receivers_payload),
     }
     heatmap_asset = Asset(
@@ -2473,6 +2652,9 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "loss_components": _clean_json(coverage_payload.get('loss_components')),
         "gain_components": _clean_json(coverage_payload.get('gain_components')),
         "colorbar_bounds": _clean_json(coverage_payload.get('colorbar_bounds')),
+        "tx_location_name": coverage_payload.get('tx_location_name'),
+        "tx_site_elevation": coverage_payload.get('tx_site_elevation'),
+        "tx_parameters": _clean_json(coverage_payload.get('tx_parameters')),
     }
     if colorbar_asset:
         last_coverage["colorbar_asset_id"] = str(colorbar_asset.id)
@@ -2551,7 +2733,7 @@ def _latest_coverage_snapshot(project: Project | None):
     summary.setdefault('receivers', summary.get('receivers') or [])
 
     return summary
-def _compute_coverage_map(tx, data, include_arrays=False, label=None):
+def _compute_coverage_map(tx, data, include_arrays=False, label=None, dem_directory=None):
     """
     Gera todos os artefatos de cobertura (heatmap, barra de cores, metadados)
     em formato compatível com mapa.js / generateCoverage() / applyCoverageOverlay().
@@ -2693,6 +2875,9 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None):
 
         return float(new_lat), float(new_lon)
 
+    if dem_directory is None:
+        dem_directory = str(global_srtm_dir())
+
     # -------------------------------------------------
     # 1. PARÂMETROS DO TX / AMBIENTE / UI
     # -------------------------------------------------
@@ -2807,20 +2992,38 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None):
     # 2. GERA GRID DE TERRENO + ATENUAÇÃO P.452
     #     (usando o centro AJUSTADO!)
     # -------------------------------------------------
-    with pathprof.SrtmConf.set(
-        srtm_dir='./SRTM',
-        download='missing',
-        server='viewpano'
-    ):
-        hprof_cache = pathprof.height_map_data(
-            lon_ref,
-            lat_ref,
-            map_size_lon,
-            map_size_lat,
-            map_resolution=map_resolution,
-            zone_t=zone_t,
-            zone_r=zone_r,
-        )
+    srtm_dir = dem_directory or './SRTM'
+    download_mode = 'none'
+    try:
+        with pathprof.SrtmConf.set(
+            srtm_dir=srtm_dir,
+            download=download_mode,
+            server='viewpano'
+        ):
+            hprof_cache = pathprof.height_map_data(
+                lon_ref,
+                lat_ref,
+                map_size_lon,
+                map_size_lat,
+                map_resolution=map_resolution,
+                zone_t=zone_t,
+                zone_r=zone_r,
+            )
+    except Exception:
+        with pathprof.SrtmConf.set(
+            srtm_dir=srtm_dir,
+            download='missing',
+            server='viewpano'
+        ):
+            hprof_cache = pathprof.height_map_data(
+                lon_ref,
+                lat_ref,
+                map_size_lon,
+                map_size_lat,
+                map_resolution=map_resolution,
+                zone_t=zone_t,
+                zone_r=zone_r,
+            )
 
     results = pathprof.atten_map_fast(
         freq=frequency,
@@ -3267,6 +3470,13 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None):
 
         # usado no front para desenhar a linha de azimute (refreshDirectionGuide)
         "antenna_direction": getattr(tx, 'antenna_direction', None),
+        "tx_parameters": {
+            "power_w": getattr(tx, 'transmission_power', None),
+            "tower_height_m": getattr(tx, 'tower_height', None),
+            "rx_height_m": getattr(tx, 'rx_height', None),
+            "total_loss_db": getattr(tx, 'total_loss', None),
+            "antenna_gain_dbi": getattr(tx, 'antenna_gain', None),
+        },
 
         # resumo de ganho usado em updateGainSummary()
         "gain_components": gain_components_payload,
@@ -3392,7 +3602,41 @@ def calculate_coverage():
     # Construct the tx_object
     tx_object = _prepare_tx_object(current_user, overrides=all_overrides)
 
-    result = _compute_coverage_map(tx_object, data)
+    dataset_summary = {}
+    if project and tx_object.latitude is not None and tx_object.longitude is not None:
+        try:
+            dataset_summary = ensure_geodata_availability(
+                project,
+                tx_object.latitude,
+                tx_object.longitude,
+                data.get('lulcYear'),
+            )
+        except Exception as exc:
+            current_app.logger.warning('Falha ao preparar datasets base: %s', exc)
+            dataset_summary = {}
+
+    dem_directory = dataset_summary.get('dem_dir') if dataset_summary else None
+    result = _compute_coverage_map(tx_object, data, dem_directory=dem_directory)
+    if dataset_summary:
+        status_payload = {}
+        dem_asset = dataset_summary.get('dem_asset')
+        if dem_asset is not None:
+            meta = dem_asset.meta or {}
+            status_payload['demPath'] = dem_asset.path
+            status_payload['demTile'] = meta.get('tile')
+            status_payload['demResolution'] = meta.get('resolution')
+            status_payload['demSource'] = meta.get('source')
+        lulc_asset = dataset_summary.get('lulc_asset')
+        if lulc_asset is not None:
+            meta = lulc_asset.meta or {}
+            status_payload['lulcPath'] = lulc_asset.path
+            status_payload['lulcYear'] = meta.get('year') or dataset_summary.get('lulc_year')
+            status_payload['lulcSource'] = meta.get('source')
+        elif dataset_summary.get('lulc_year') is not None:
+            status_payload['lulcYear'] = dataset_summary['lulc_year']
+        if status_payload:
+            result['datasetStatus'] = status_payload
+
     result['receivers'] = receivers
     if project:
         result.setdefault('project_slug', project.slug)
@@ -3443,6 +3687,14 @@ def atualizar_localizacao_tx():
     except (TypeError, ValueError):
         return jsonify({'error': 'Coordenadas inválidas.'}), 400
 
+    project_slug = data.get('projectSlug') or data.get('project_slug')
+    project = None
+    if project_slug:
+        try:
+            project = project_by_slug_or_404(project_slug, current_user.uuid)
+        except NotFound:
+            project = None
+
     user = User.query.get(current_user.id)
     if not user:
         return jsonify({'error': 'Usuário não encontrado.'}), 404
@@ -3458,7 +3710,19 @@ def atualizar_localizacao_tx():
     if elevation is not None:
         user.tx_site_elevation = elevation
 
+    if project:
+        settings = dict(project.settings or {})
+        settings['latitude'] = lat
+        settings['longitude'] = lon
+        if municipality:
+            settings['txLocationName'] = municipality
+        if elevation is not None:
+            settings['txElevation'] = elevation
+        project.settings = settings
+
     try:
+        if project:
+            db.session.add(project)
         db.session.commit()
     except SQLAlchemyError as exc:
         db.session.rollback()
@@ -3467,6 +3731,7 @@ def atualizar_localizacao_tx():
     return jsonify({
         'municipality': user.tx_location_name,
         'elevation': user.tx_site_elevation,
+        'project': project.slug if project else None,
     }), 200
 
 @bp.route('/clima-recomendado', methods=['GET'])
@@ -3696,6 +3961,10 @@ def carregar_dados():
                 user_data['latitude'] = center.get('lat')
             if center and user_data.get('longitude') is None:
                 user_data['longitude'] = center.get('lng')
+            if latest_snapshot.get('tx_location_name') and not user_data.get('txLocationName'):
+                user_data['txLocationName'] = latest_snapshot['tx_location_name']
+            if latest_snapshot.get('tx_site_elevation') is not None and user_data.get('txElevation') is None:
+                user_data['txElevation'] = latest_snapshot['tx_site_elevation']
 
         if project_settings:
             user_data['coverageEngine'] = project_settings.get('coverageEngine', user_data['coverageEngine'])
@@ -3721,3 +3990,18 @@ def carregar_dados():
 def logout():
     logout_user()
     return redirect(url_for('ui.index'))
+
+
+@bp.route('/reverse-geocode')
+@login_required
+def reverse_geocode():
+    try:
+        lat = request.args.get('lat', type=float)
+        lon = request.args.get('lon', type=float)
+        if lat is None or lon is None:
+            return jsonify({'error': 'Parâmetros inválidos.'}), 400
+        municipality = _lookup_municipality(lat, lon)
+        return jsonify({'municipality': municipality or '-'}), 200
+    except Exception as exc:
+        current_app.logger.warning('reverse_geocode.failed: %s', exc)
+        return jsonify({'error': 'Não foi possível determinar o município.'}), 500

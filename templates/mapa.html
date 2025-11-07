@@ -198,6 +198,11 @@
             <h3 class="card-title">Perfil Profissional</h3>
             <p class="assist-text">Selecione um ponto RX no mapa para visualizar o perfil com Fresnel e curvatura.</p>
             <button class="btn btn-outline-primary w-100" id="btnGenerateProfile" disabled>Gerar perfil do enlace</button>
+            <div class="text-center mt-3" id="profileSpinner" hidden>
+                <div class="spinner-border text-primary" role="status">
+                    <span class="visually-hidden">Gerando perfil do enlace...</span>
+                </div>
+            </div>
         </div>
 
         <div class="panel-card">
@@ -236,6 +241,7 @@
             <div class="coverage-spinner-icon" aria-hidden="true"></div>
             <span>Gerando cobertura...</span>
         </div>
+        <div class="map-floating-card tx-card" id="txLegend" hidden></div>
         <div class="map-floating-card" id="mapTooltip" hidden></div>
     </div>
 </section>

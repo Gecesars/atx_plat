@@ -42,6 +42,7 @@
         projectSlug: coverageContainer.dataset.project || '',
         projectName: coverageContainer.dataset.projectName || '',
         engine: coverageContainer.dataset.selectedEngine || 'p1546',
+        txData: {},
     };
 
     if (!ENGINE_INFO[state.engine]) {
@@ -190,6 +191,61 @@
         updateGenerateButton();
     }
 
+    function applyTxMetadataLabels(payload = {}) {
+        const nameLabel = document.getElementById('txLocationName');
+        if (nameLabel && payload.municipality) {
+            nameLabel.textContent = payload.municipality;
+        }
+        const elevationLabel = document.getElementById('txElevation');
+        if (elevationLabel && payload.elevation !== undefined && payload.elevation !== null) {
+            elevationLabel.textContent = Number(payload.elevation).toFixed(1);
+        }
+    }
+
+    function persistTxCoordinates(lat, lon) {
+        const parsedLat = Number(lat);
+        const parsedLon = Number(lon);
+        if (!Number.isFinite(parsedLat) || !Number.isFinite(parsedLon)) {
+            return Promise.resolve();
+        }
+        const payload = {
+            latitude: Number(parsedLat.toFixed(6)),
+            longitude: Number(parsedLon.toFixed(6)),
+        };
+        if (state.projectSlug) {
+            payload.projectSlug = state.projectSlug;
+        }
+        return fetch('/tx-location', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        })
+            .then((response) => response.json().then((json) => {
+                if (!response.ok) {
+                    throw new Error(json.error || 'Falha ao salvar coordenadas da TX.');
+                }
+                return json;
+            }))
+            .then((data) => {
+                applyTxMetadataLabels(data);
+                state.txData = state.txData || {};
+                state.txData.latitude = payload.latitude;
+                state.txData.longitude = payload.longitude;
+                if (data.municipality) {
+                    state.txData.txLocationName = data.municipality;
+                }
+                if (data.elevation !== undefined && data.elevation !== null) {
+                    state.txData.txElevation = data.elevation;
+                }
+                return data;
+            })
+            .catch((error) => {
+                console.error(error);
+                notify(error.message || 'Não foi possível atualizar os dados da TX.', 'danger');
+                throw error;
+            });
+    }
+
     function parseCoordinatesFromField() {
         const coordinatesField = document.getElementById('coordinates');
         if (!coordinatesField || !coordinatesField.value) {
@@ -230,6 +286,14 @@
             }
             const data = await response.json();
             const projectSettings = data.projectSettings || {};
+            state.txData = {
+                latitude: data.latitude,
+                longitude: data.longitude,
+                txLocationName: data.txLocationName,
+                txElevation: data.txElevation,
+                transmissionPower: data.transmissionPower,
+                towerHeight: data.towerHeight,
+            };
 
             setFieldValue('towerHeight', data.towerHeight);
             setFieldValue('rxHeight', data.rxHeight);
@@ -254,14 +318,10 @@
             setFieldValue('minSignalLevel', data.minSignalLevel ?? projectSettings.minSignalLevel ?? '');
             setFieldValue('maxSignalLevel', data.maxSignalLevel ?? projectSettings.maxSignalLevel ?? '');
 
-            const nameLabel = document.getElementById('txLocationName');
-            if (nameLabel) {
-                nameLabel.textContent = data.txLocationName || '-';
-            }
-            const elevationLabel = document.getElementById('txElevation');
-            if (elevationLabel) {
-                elevationLabel.textContent = data.txElevation ?? '-';
-            }
+            applyTxMetadataLabels({
+                municipality: data.txLocationName || '-',
+                elevation: data.txElevation,
+            });
 
             if (data.latitude !== undefined && data.longitude !== undefined && data.latitude !== null && data.longitude !== null) {
                 setCoordinatesText(data.latitude, data.longitude);
@@ -417,6 +477,20 @@
                 updateLastSaved(data.generated_at);
             }
 
+            if (data.datasetStatus) {
+                const { demTile, lulcYear } = data.datasetStatus;
+                const parts = [];
+                if (demTile) {
+                    parts.push(`DEM ${demTile}`);
+                }
+                if (lulcYear) {
+                    parts.push(`LULC ${lulcYear}`);
+                }
+                if (parts.length) {
+                    notify(`Dados base carregados: ${parts.join(' · ')}`, 'info', 4500);
+                }
+            }
+
             notify('Cobertura gerada com sucesso! Atualizando visão do projeto...', 'success');
 
             window.setTimeout(() => {
@@ -483,6 +557,7 @@
         const latitude = marker.getPosition().lat().toFixed(6);
         const longitude = marker.getPosition().lng().toFixed(6);
         setCoordinatesText(latitude, longitude);
+        persistTxCoordinates(Number(latitude), Number(longitude)).catch(() => {});
         modals.map?.hide();
     }
 
@@ -506,6 +581,7 @@
         const lonDecimal = (Math.abs(lonDegrees) + (lonMinutes / 60) + (lonSeconds / 3600)) * (lonDirection === 'W' ? -1 : 1);
 
         setCoordinatesText(latDecimal, lonDecimal);
+        persistTxCoordinates(latDecimal, lonDecimal).catch(() => {});
         modals.coordinates?.hide();
     }
 

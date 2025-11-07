@@ -32,7 +32,8 @@ Thumbs.db
 *.egg-info/
 build/
 dist/
-
+SRTM/
+storage/
 codex/
 
 # Arquivos de configuração local

@@ -17,7 +17,10 @@ const state = {
     pendingTiltTimeout: null,
     pendingDirectionTimeout: null,
     coverageUnit: 'dbuv',
+    rxInfoWindow: null,
 };
+
+let profileLoading = false;
 
 function formatNumber(value, suffix = '') {
     if (value === undefined || value === null || Number.isNaN(value)) {
@@ -65,6 +68,119 @@ function parseNullableNumber(raw) {
     }
     const asNumber = Number(text);
     return Number.isFinite(asNumber) ? asNumber : null;
+}
+
+function formatLegendValue(value, suffix = '') {
+    if (value === undefined || value === null || Number.isNaN(value)) {
+        return '-';
+    }
+    return `${Number(value).toFixed(2)}${suffix}`;
+}
+
+function updateTxLegend(data) {
+    const legend = document.getElementById('txLegend');
+    if (!legend || !data) {
+        return;
+    }
+    const municipality = data.txLocationName
+        || data.tx_location_name
+        || data.municipality
+        || '-';
+    const power = data.transmissionPower ?? data.transmission_power;
+    const tower = data.towerHeight ?? data.tower_height;
+    const elevation = data.txElevation ?? data.tx_site_elevation;
+
+    legend.innerHTML = `
+        <div class="tx-legend-title">Transmissor</div>
+        <div class="tx-legend-line"><span>Município</span><strong>${municipality}</strong></div>
+        <div class="tx-legend-line"><span>Potência</span><strong>${formatLegendValue(power, ' W')}</strong></div>
+        <div class="tx-legend-line"><span>Terreno</span><strong>${formatLegendValue(elevation, ' m')}</strong></div>
+        <div class="tx-legend-line"><span>Altura torre</span><strong>${formatLegendValue(tower, ' m')}</strong></div>
+    `;
+    legend.hidden = false;
+}
+
+function persistTxLocation(latLng) {
+    const payload = {
+        latitude: Number(latLng.lat().toFixed(6)),
+        longitude: Number(latLng.lng().toFixed(6)),
+    };
+    const projectSlug = getActiveProjectSlug();
+    if (projectSlug) {
+        payload.projectSlug = projectSlug;
+    }
+    return fetch('/tx-location', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+    })
+        .then((response) => response.json().then((json) => {
+            if (!response.ok) {
+                throw new Error(json.error || 'Falha ao salvar a localização da TX.');
+            }
+            return json;
+        }))
+        .then((data) => {
+            if (!state.txData) {
+                state.txData = {};
+            }
+            state.txData.latitude = payload.latitude;
+            state.txData.longitude = payload.longitude;
+            if (data.municipality) {
+                state.txData.txLocationName = data.municipality;
+            }
+            if (data.elevation !== undefined && data.elevation !== null) {
+                state.txData.txElevation = data.elevation;
+            }
+            updateTxSummary(state.txData);
+            showToast('Localização da TX atualizada.', false);
+            return data;
+        })
+        .catch((error) => {
+            console.error(error);
+            showToast(error.message || 'Não foi possível salvar a nova posição da TX.', true);
+            throw error;
+        });
+}
+
+function getRxLabel(index) {
+    return `RX ${index + 1}`;
+}
+
+function openRxLegend(entry) {
+    if (!state.rxInfoWindow || !entry) {
+        return;
+    }
+    const index = state.rxEntries.indexOf(entry);
+    if (index < 0) {
+        return;
+    }
+    const summary = entry.summary || {};
+    const municipalityLine = summary.municipality ? `<div>Município: ${summary.municipality}</div>` : '';
+    const content = `
+        <div class="rx-legend">
+            <strong>${entry.label || getRxLabel(index)}</strong>
+            <div>Nível: ${summary.field || '-'}</div>
+            <div>Altitude: ${summary.elevation || '-'}</div>
+            ${municipalityLine}
+        </div>
+    `;
+    state.rxInfoWindow.setContent(content);
+    state.rxInfoWindow.open({
+        map: state.map,
+        anchor: entry.marker,
+    });
+}
+
+function getActiveProjectSlug() {
+    if (window.coverageProjectSlug) {
+        return window.coverageProjectSlug;
+    }
+    const container = document.getElementById('coverageMapContainer');
+    if (container && container.dataset.project) {
+        return container.dataset.project;
+    }
+    return null;
 }
 
 function blobToBase64(blob) {
@@ -210,6 +326,8 @@ function updateTxSummary(data) {
             climateInfoEl.textContent = 'Clima não ajustado para esta localização';
         }
     }
+
+    updateTxLegend(data);
 }
 
 function updateGainSummary(gainComponents, scale) {
@@ -306,16 +424,23 @@ function refreshReceiverSummaries() {
 
 function serializeReceivers() {
     return state.rxEntries
-        .map((entry) => {
+        .map((entry, index) => {
             const position = entry.marker.getPosition();
             const lat = Number(position.lat());
             const lng = Number(position.lng());
             if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
                 return null;
             }
+            const summary = entry.summary || {};
             return {
                 lat: Number(lat.toFixed(7)),
                 lng: Number(lng.toFixed(7)),
+                label: entry.label || getRxLabel(index),
+                field: summary.field || null,
+                elevation: summary.elevation || null,
+                distance: summary.distance || null,
+                bearing: summary.bearing || null,
+                municipality: summary.municipality || null,
             };
         })
         .filter(Boolean);
@@ -333,7 +458,18 @@ function restoreReceivers(receivers) {
             return;
         }
         const position = new google.maps.LatLng(lat, lng);
-        createRxMarker(position, { selectOnCreate: false });
+        const presetSummary = {
+            field: receiver.field || null,
+            elevation: receiver.elevation || null,
+            distance: receiver.distance || null,
+            bearing: receiver.bearing || null,
+            municipality: receiver.municipality || null,
+        };
+        createRxMarker(position, {
+            selectOnCreate: false,
+            presetLabel: receiver.label || null,
+            presetSummary,
+        });
     });
     state.selectedRxIndex = null;
     updateLinkSummary({});
@@ -350,6 +486,18 @@ function showToast(message, isError = false) {
     }, 3600);
 }
 
+function setProfileLoading(isLoading) {
+    profileLoading = Boolean(isLoading);
+    const spinner = document.getElementById('profileSpinner');
+    if (spinner) {
+        spinner.hidden = !profileLoading;
+    }
+    const button = document.getElementById('btnGenerateProfile');
+    if (button) {
+        button.disabled = profileLoading || state.selectedRxIndex === null;
+    }
+}
+
 function setCoverageLoading(isLoading) {
     const spinner = document.getElementById('coverageSpinner');
     if (spinner) {
@@ -363,6 +511,23 @@ function setCoverageLoading(isLoading) {
     toggleElements.forEach((element) => {
         element.disabled = isLoading;
     });
+}
+
+function fetchMunicipality(latLng) {
+    const lat = Number(latLng.lat());
+    const lng = Number(latLng.lng());
+    if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+        return Promise.resolve(null);
+    }
+    const params = new URLSearchParams({ lat, lon: lng });
+    return fetch(`/reverse-geocode?${params.toString()}`)
+        .then((response) => response.json().then((json) => {
+            if (!response.ok) {
+                throw new Error(json.error || 'Falha ao buscar município.');
+            }
+            return json.municipality || null;
+        }))
+        .catch(() => null);
 }
 
 function ensureElevationService() {
@@ -627,12 +792,25 @@ async function loadCoverageOverlay(lastCoverage) {
     state.coverageData.signal_level_dict = coveragePayload.signal_level_dict;
     state.coverageData.signal_level_dict_dbm = coveragePayload.signal_level_dict_dbm;
     state.coverageData.project_slug = slug;
-
     if (state.txData) {
         state.txData.location_status = coveragePayload.location_status || state.txData.location_status;
         if (coveragePayload.center) {
             state.txData.latitude = coveragePayload.center.lat;
             state.txData.longitude = coveragePayload.center.lng;
+        }
+        if (coveragePayload.tx_location_name) {
+            state.txData.txLocationName = coveragePayload.tx_location_name;
+        }
+        if (coveragePayload.tx_site_elevation !== undefined && coveragePayload.tx_site_elevation !== null) {
+            state.txData.txElevation = coveragePayload.tx_site_elevation;
+        }
+        if (coveragePayload.tx_parameters) {
+            const params = coveragePayload.tx_parameters;
+            if (params.power_w !== undefined) state.txData.transmissionPower = params.power_w;
+            if (params.tower_height_m !== undefined) state.txData.towerHeight = params.tower_height_m;
+            if (params.rx_height_m !== undefined) state.txData.rxHeight = params.rx_height_m;
+            if (params.total_loss_db !== undefined) state.txData.total_loss = params.total_loss_db;
+            if (params.antenna_gain_dbi !== undefined) state.txData.antennaGain = params.antenna_gain_dbi;
         }
         updateTxSummary(state.txData);
     }
@@ -727,6 +905,7 @@ function selectRx(index) {
     highlightRxEntry(index);
     const entry = state.rxEntries[index];
     updateLinkVisuals(entry);
+    openRxLegend(entry);
     document.getElementById('btnGenerateProfile').disabled = false;
 }
 
@@ -744,6 +923,9 @@ function removeRx(index) {
     renderRxList();
     if (state.coverageData) {
         state.coverageData.receivers = serializeReceivers();
+    }
+    if (state.rxInfoWindow) {
+        state.rxInfoWindow.close();
     }
 }
 
@@ -763,6 +945,9 @@ function clearReceivers() {
     if (state.coverageData) {
         state.coverageData.receivers = [];
     }
+    if (state.rxInfoWindow) {
+        state.rxInfoWindow.close();
+    }
 }
 
 function renderRxList() {
@@ -780,7 +965,7 @@ function renderRxList() {
 
         const title = document.createElement('div');
         title.className = 'rx-title';
-        title.textContent = `RX ${idx + 1}`;
+        title.textContent = entry.label || getRxLabel(idx);
 
         const details = document.createElement('div');
         details.className = 'rx-details';
@@ -859,16 +1044,31 @@ function computeReceiverSummary(position) {
         }
     }
 
-    return ensureElevationServiceAndGet(position).then((elevation) => {
-        if (elevation !== null) {
-            summary.elevation = `${elevation.toFixed(1)} m`;
-        }
-        return summary;
-    });
+    return ensureElevationServiceAndGet(position)
+        .then((elevation) => {
+            if (elevation !== null) {
+                summary.elevation = `${elevation.toFixed(1)} m`;
+            }
+            return fetchMunicipality(position);
+        })
+        .then((municipality) => {
+            if (municipality) {
+                summary.municipality = municipality;
+            }
+            return summary;
+        })
+        .catch(() => summary);
 }
 
 function createRxMarker(position, options = {}) {
-    const { selectOnCreate = true } = options;
+    const {
+        selectOnCreate = true,
+        presetLabel = null,
+        presetSummary = null,
+    } = options;
+
+    const nextIndex = state.rxEntries.length;
+    const labelText = presetLabel || getRxLabel(nextIndex);
 
     const defaultIcon = {
         path: google.maps.SymbolPath.CIRCLE,
@@ -891,13 +1091,19 @@ function createRxMarker(position, options = {}) {
         position,
         map: state.map,
         icon: defaultIcon,
-        title: `RX ${state.rxEntries.length + 1}`,
+        title: labelText,
+        label: {
+            text: labelText,
+            color: '#ffffff',
+            fontWeight: '600',
+        },
     });
 
     const entry = {
         marker,
         summary: null,
         icons: { default: defaultIcon, selected: selectedIcon },
+        label: labelText,
     };
 
     marker.addListener('click', () => {
@@ -909,13 +1115,20 @@ function createRxMarker(position, options = {}) {
 
     state.rxEntries.push(entry);
 
-    computeReceiverSummary(position).then((summary) => {
+    const hydrateSummary = (summary) => {
         entry.summary = summary;
         if (state.selectedRxIndex === state.rxEntries.indexOf(entry)) {
             updateLinkSummary(summary);
+            openRxLegend(entry);
         }
         renderRxList();
-    });
+    };
+
+    if (presetSummary) {
+        hydrateSummary(presetSummary);
+    }
+
+    computeReceiverSummary(position).then(hydrateSummary);
 
     renderRxList();
     if (selectOnCreate) {
@@ -966,7 +1179,7 @@ function setTxCoords(latLng, { pan = false } = {}) {
 function handleTxDragEnd(event) {
     const position = event.latLng;
     setTxCoords(position, { pan: false });
-    showToast('Posição da TX atualizada. Gere a cobertura novamente.', false);
+    persistTxLocation(position).catch(() => {});
 }
 
 function saveTilt(value) {
@@ -1236,6 +1449,12 @@ function generateProfile() {
     const entry = state.rxEntries[state.selectedRxIndex];
     if (!entry || !state.txCoords) return;
 
+    const projectSlug = getActiveProjectSlug();
+    if (!projectSlug) {
+        showToast('Defina um projeto antes de gerar o perfil.', true);
+        return;
+    }
+
     const tx = state.txCoords;
     const rx = entry.marker.getPosition();
 
@@ -1244,8 +1463,10 @@ function generateProfile() {
             { lat: tx.lat(), lng: tx.lng() },
             { lat: rx.lat(), lng: rx.lng() },
         ],
+        projectSlug,
     };
 
+    setProfileLoading(true);
     fetch('/gerar_img_perfil', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1258,6 +1479,9 @@ function generateProfile() {
         return response.json();
     })
     .then((data) => {
+        if (data.message) {
+            showToast(data.message, Boolean(data.warning));
+        }
         const img = document.getElementById('profileImage');
         img.src = `data:image/png;base64,${data.image}`;
         const modal = bootstrap.Modal.getOrCreateInstance(document.getElementById('profileModal'));
@@ -1266,6 +1490,9 @@ function generateProfile() {
     .catch((error) => {
         console.error(error);
         showToast('Não foi possível gerar o perfil', true);
+    })
+    .finally(() => {
+        setProfileLoading(false);
     });
 }
 
@@ -1420,6 +1647,7 @@ function initCoverageMap() {
                 mapTypeId: 'terrain',
                 gestureHandling: 'greedy',
             });
+            state.rxInfoWindow = new google.maps.InfoWindow();
 
             state.txMarker = new google.maps.Marker({
                 position: txLatLng,

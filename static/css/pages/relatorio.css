@@ -1,0 +1,61 @@
+.report-editor {
+    min-height: 60vh;
+}
+
+.report-editor .editor-card {
+    background-color: #fff;
+    border-radius: 1rem;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    padding: 1.5rem;
+    box-shadow: 0 12px 32px rgba(13, 71, 161, 0.08);
+}
+
+.report-editor .preview-img {
+    width: 100%;
+    border-radius: 0.75rem;
+    border: 1px solid rgba(0, 0, 0, 0.06);
+    background-color: #f5f7fb;
+}
+
+.report-editor .section-title {
+    font-size: 0.95rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: #607d8b;
+    margin-bottom: 0.5rem;
+}
+
+.report-editor .form-control,
+.report-editor .form-select {
+    border-radius: 0.6rem;
+    border-color: rgba(0, 0, 0, 0.08);
+}
+
+.report-editor .recommendations-list input {
+    margin-bottom: 0.5rem;
+}
+
+.report-editor .diagram-grid img {
+    width: 100%;
+    border-radius: 0.6rem;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    background: #fdfdfd;
+}
+
+.report-editor .loading-overlay {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 200px;
+}
+
+.report-editor .link-summary {
+    background-color: #f5f7fb;
+    border-radius: 0.6rem;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    padding: 1rem;
+    font-size: 0.85rem;
+    max-height: 240px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}

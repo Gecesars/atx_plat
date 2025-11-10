@@ -91,17 +91,16 @@
                 {% endfor %}
                 <a class="btn btn-outline-secondary" href="{{ projects_list_url }}">Projetos</a>
                 {% if selected_project %}
-                    <button class="btn btn-outline-secondary d-flex align-items-center" id="btnSimpleReport" data-project="{{ selected_project.slug }}">
-                        <span class="spinner-border spinner-border-sm me-2 d-none" id="simpleReportSpinner" role="status" aria-hidden="true"></span>
-                        Baixar Relatório PDF
-                    </button>
+                    <a class="btn btn-outline-secondary" href="{{ url_for('ui.report_editor', slug=selected_project.slug) }}">
+                        Gerar Relatório
+                    </a>
                     <button class="btn btn-outline-success d-flex align-items-center" id="btnAnalysisReport" data-project="{{ selected_project.slug }}">
                         <span class="spinner-border spinner-border-sm me-2 d-none" id="analysisReportSpinner" role="status" aria-hidden="true"></span>
-                        Relatório de Análise
+                        <span class="report-label">Relatório de Análise</span>
                     </button>
                     <button class="btn btn-outline-warning d-flex align-items-center" id="btnRegReport" data-project="{{ selected_project.slug }}">
                         <span class="spinner-border spinner-border-sm me-2 d-none" id="regReportSpinner" role="status" aria-hidden="true"></span>
-                        Relatório ANATEL
+                        <span class="report-label">Relatório ANATEL</span>
                     </button>
                     <a class="btn btn-outline-info" target="_blank" href="{{ url_for('regulator_api.anatel_basic_form', slug=selected_project.slug) }}">Checklist ANATEL (JSON)</a>
                 {% endif %}
@@ -544,42 +543,6 @@ async function generateAnalysisReport(button) {
     }
 }
 
-async function downloadSimpleReport(button) {
-    const slug = button?.dataset?.project;
-    const spinner = document.getElementById('simpleReportSpinner');
-    button.disabled = true;
-    if (spinner) spinner.classList.remove('d-none');
-    try {
-        const url = slug ? `/gerar-relatorio?project=${encodeURIComponent(slug)}` : '/gerar-relatorio';
-        const response = await fetch(url, { credentials: 'same-origin' });
-        if (!response.ok) {
-            const text = await response.text();
-            throw new Error(text || 'Falha ao gerar relatório.');
-        }
-        const blob = await response.blob();
-        const contentDisposition = response.headers.get('Content-Disposition') || '';
-        let filename = 'relatorio.pdf';
-        const match = contentDisposition.match(/filename="?([^\";]+)"?/i);
-        if (match) filename = match[1];
-        const downloadUrl = URL.createObjectURL(blob);
-        const link = document.createElement('a');
-        link.href = downloadUrl;
-        link.download = filename;
-        document.body.appendChild(link);
-        link.click();
-        setTimeout(() => {
-            URL.revokeObjectURL(downloadUrl);
-            document.body.removeChild(link);
-        }, 2000);
-        showToast('Relatório baixado com sucesso.', 'success');
-    } catch (error) {
-        showToast(error.message || 'Erro ao baixar o relatório.', 'danger');
-    } finally {
-        if (spinner) spinner.classList.add('d-none');
-        button.disabled = false;
-    }
-}
-
 document.addEventListener('DOMContentLoaded', () => {
     const regBtn = document.getElementById('btnRegReport');
     if (regBtn) {
@@ -588,10 +551,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const analysisBtn = document.getElementById('btnAnalysisReport');
     if (analysisBtn) {
         analysisBtn.addEventListener('click', () => generateAnalysisReport(analysisBtn));
-    }
-    const simpleBtn = document.getElementById('btnSimpleReport');
-    if (simpleBtn) {
-        simpleBtn.addEventListener('click', () => downloadSimpleReport(simpleBtn));
     }
 });
 </script>

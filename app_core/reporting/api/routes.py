@@ -5,7 +5,7 @@ from flask_login import login_required, current_user
 
 from app_core.utils import project_by_slug_or_404
 
-from ..service import generate_analysis_report, AnalysisReportError
+from ..service import generate_analysis_report, AnalysisReportError, build_analysis_preview
 from . import bp
 
 
@@ -18,7 +18,8 @@ def analysis_report():
         return jsonify({'error': 'Informe o slug do projeto.'}), 400
     project = project_by_slug_or_404(slug, current_user.uuid)
     try:
-        report = generate_analysis_report(project)
+        overrides = payload.get('overrides') or {}
+        report = generate_analysis_report(project, overrides=overrides)
     except AnalysisReportError as exc:
         return jsonify({'error': str(exc)}), 400
     download_url = None
@@ -30,3 +31,17 @@ def analysis_report():
         'title': report.title,
         'download_url': download_url,
     }), 201
+
+
+@bp.route('/analysis/context', methods=['GET'])
+@login_required
+def analysis_context():
+    slug = request.args.get('project') or request.args.get('projectSlug')
+    if not slug:
+        return jsonify({'error': 'Informe o slug do projeto.'}), 400
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    try:
+        context = build_analysis_preview(project)
+    except AnalysisReportError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify(context), 200

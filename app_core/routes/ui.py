@@ -64,7 +64,7 @@ from app_core.models import (
     CoverageStatus,
 )
 from app_core.email_utils import generate_token, load_token, send_email
-from app_core.storage import ensure_storage_structure, storage_root
+from app_core.storage import ensure_storage_structure, ensure_project_path_exists, storage_root
 from app_core.reporting.service import generate_analysis_report, AnalysisReportError
 from app_core.data_acquisition import ensure_geodata_availability, ensure_rt3d_scene, global_srtm_dir
 from app_core.utils import (
@@ -75,6 +75,7 @@ from app_core.utils import (
     slugify,
 )
 from app_core.regulatory.service import build_default_payload
+from app_core.integrations import ibge as ibge_api
 
 matplotlib.use('Agg')
 
@@ -1195,13 +1196,32 @@ def home():
             return None
         return base64.b64encode(blob).decode('utf-8')
 
+    def _sanitize_numeric_string(value: str):
+        cleaned = value.strip()
+        for suffix in ('dBm', 'dBµV/m', 'dBuV/m', 'dBuv/m', 'km', 'm', 'MHz', 'kW', 'W'):
+            if cleaned.lower().endswith(suffix.lower()):
+                cleaned = cleaned[: -len(suffix)]
+        cleaned = cleaned.replace(',', '.')
+        cleaned = re.sub(r'[^0-9\-\.+eE]', '', cleaned)
+        return cleaned
+
     def _coerce_float(value):
-        if value in (None, '', []):
-            return value
+        if value in (None, '', [], '—'):
+            return None
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            cleaned = _sanitize_numeric_string(value)
+            if cleaned in ('', '-', '.', '-.', '+'):
+                return None
+            try:
+                return float(cleaned)
+            except (TypeError, ValueError):
+                return None
         try:
             return float(value)
         except (TypeError, ValueError):
-            return value
+            return None
 
     def _normalize_receivers(receivers):
         normalized = []
@@ -1218,14 +1238,24 @@ def home():
             lng = raw.get('lng')
             if lng is None:
                 lng = location.get('lng') or location.get('lon')
+            field_value = _coerce_float(
+                raw.get('field_strength_dbuv_m')
+                or raw.get('field_dbuv')
+                or raw.get('field')
+            )
+            power_value = _coerce_float(
+                raw.get('power_dbm') or raw.get('received_power_dbm') or raw.get('power')
+            )
+            distance_value = _coerce_float(raw.get('distance_km') or raw.get('distance'))
+            altitude_value = _coerce_float(raw.get('altitude_m') or location.get('altitude'))
             normalized.append({
                 'label': label,
                 'municipality': raw.get('municipality') or location.get('municipality'),
                 'coordinates': {'lat': lat, 'lng': lng} if lat is not None and lng is not None else None,
-                'field': raw.get('field_strength_dbuv_m') or raw.get('field_dbuv') or raw.get('field'),
-                'power': raw.get('power_dbm') or raw.get('received_power_dbm') or raw.get('power'),
-                'distance': raw.get('distance_km') or raw.get('distance'),
-                'altitude': raw.get('altitude_m') or location.get('altitude'),
+                'field': field_value,
+                'power': power_value,
+                'distance': distance_value,
+                'altitude': altitude_value,
                 'quality': raw.get('quality') or raw.get('status'),
             })
         return normalized
@@ -2705,10 +2735,7 @@ def _compute_site_elevation(lat, lon):
         return None
 
 
-def _lookup_municipality(lat, lon):
-    def _format(parts):
-        return ', '.join([part for part in parts if part]) or None
-
+def _lookup_municipality_details(lat, lon, include_ibge=False):
     providers = (
         (
             'open-meteo',
@@ -2740,27 +2767,150 @@ def _lookup_municipality(lat, lon):
             resp = requests.get(url, params=params, timeout=15, **extra)
             resp.raise_for_status()
             data = resp.json()
+            detail = None
             if provider == 'open-meteo':
                 results = data.get('results') or []
                 if not results:
                     continue
                 item = results[0]
-                parts = [item.get('name'), item.get('admin1'), item.get('country')]
-                formatted = _format(parts)
+                state_name = item.get('admin1')
+                detail = {
+                    'name': item.get('name'),
+                    'state': state_name,
+                    'state_code': ibge_api.normalize_state_code(state_name),
+                    'country': item.get('country'),
+                    'provider': provider,
+                }
             else:
                 address = data.get('address') or {}
-                parts = [
-                    address.get('city') or address.get('town') or address.get('village') or address.get('municipality'),
-                    address.get('state'),
-                    address.get('country'),
-                ]
-                formatted = _format(parts)
-            if formatted:
-                return formatted
+                state_label = address.get('state_code') or address.get('state')
+                detail = {
+                    'name': address.get('city') or address.get('town') or address.get('village') or address.get('municipality'),
+                    'state': address.get('state'),
+                    'state_code': ibge_api.normalize_state_code(state_label),
+                    'country': address.get('country'),
+                    'provider': provider,
+                }
+            if detail and include_ibge and detail.get('name'):
+                state_hint = detail.get('state_code') or detail.get('state')
+                detail['ibge_code'] = ibge_api.resolve_municipality_code(detail['name'], state_hint)
+            if detail and detail.get('name'):
+                return detail
         except Exception as exc:
             current_app.logger.warning('Geocoding provider %s falhou: %s', provider, exc)
             continue
     return None
+
+
+def _lookup_municipality(lat, lon):
+    details = _lookup_municipality_details(lat, lon, include_ibge=False)
+    if not details:
+        return None
+    parts = [details.get('name'), details.get('state'), details.get('country')]
+    formatted = ', '.join(part for part in parts if part)
+    return formatted or None
+
+
+def _downsample_sequence(values, max_points=256):
+    if not values:
+        return []
+    sequence = []
+    for value in values:
+        try:
+            sequence.append(float(value))
+        except (TypeError, ValueError):
+            continue
+    length = len(sequence)
+    if length <= max_points:
+        return sequence
+    step = max(1, length // max_points)
+    downsampled = sequence[::step]
+    if len(downsampled) > max_points:
+        downsampled = downsampled[:max_points]
+    return downsampled
+
+
+def _build_receiver_profile(tx_coords, rx_coords):
+    try:
+        profile = _google_elevation_profile(tx_coords, rx_coords, samples=256)
+    except Exception:
+        profile = None
+    if not profile:
+        return None
+    distance_km = None
+    if profile.get('distance_m') is not None:
+        distance_km = float(profile['distance_m']) / 1000.0
+    return {
+        'source': profile.get('source', 'google'),
+        'samples': profile.get('samples'),
+        'distance_km': distance_km,
+        'elevations_m': _downsample_sequence(profile.get('elevations_m')),
+        'latitudes': _downsample_sequence(profile.get('latitudes')),
+        'longitudes': _downsample_sequence(profile.get('longitudes')),
+    }
+
+
+def _enrich_receivers_metadata(receivers, tx_object):
+    if not receivers:
+        return receivers
+    enriched = []
+    location_cache = {}
+    demographics_cache = {}
+    tx_coords = None
+    if tx_object and tx_object.latitude is not None and tx_object.longitude is not None:
+        tx_coords = {'lat': float(tx_object.latitude), 'lng': float(tx_object.longitude)}
+    for receiver in receivers:
+        rx_copy = dict(receiver)
+        location = dict(rx_copy.get('location') or {})
+        lat = _coerce_float(rx_copy.get('lat') or location.get('lat') or location.get('latitude'))
+        lon = _coerce_float(rx_copy.get('lng') or rx_copy.get('lon') or location.get('lng') or location.get('lon') or location.get('longitude'))
+        if lat is not None:
+            location['lat'] = lat
+        if lon is not None:
+            location['lng'] = lon
+
+        details = None
+        if lat is not None and lon is not None:
+            cache_key = (round(lat, 5), round(lon, 5))
+            details = location_cache.get(cache_key)
+            if details is None:
+                details = _lookup_municipality_details(lat, lon, include_ibge=True)
+                location_cache[cache_key] = details
+
+        if details:
+            municipality_name = details.get('name')
+            state_label = details.get('state_code') or details.get('state')
+            location['municipality'] = municipality_name
+            location['state'] = details.get('state')
+            location['state_code'] = details.get('state_code')
+            location['country'] = details.get('country')
+            rx_copy['location'] = location
+            if municipality_name:
+                rx_copy.setdefault('municipality', municipality_name)
+            if state_label:
+                rx_copy['state'] = state_label
+            ibge_code = details.get('ibge_code')
+            demographics = None
+            if ibge_code:
+                demographics = demographics_cache.get(ibge_code)
+                if demographics is None:
+                    demographics = ibge_api.fetch_demographics_by_code(ibge_code)
+                    demographics_cache[ibge_code] = demographics
+            ibge_payload = {
+                'code': ibge_code,
+                'name': municipality_name,
+                'state': state_label,
+                'demographics': demographics,
+            }
+            rx_copy['ibge'] = {k: v for k, v in ibge_payload.items() if v not in (None, '', {}, [])}
+
+        if tx_coords and lat is not None and lon is not None:
+            profile = _build_receiver_profile(tx_coords, {'lat': lat, 'lng': lon})
+            if profile:
+                rx_copy['profile'] = profile
+
+        enriched.append(rx_copy)
+    return enriched
 
 
 
@@ -2830,6 +2980,7 @@ def _google_elevation_profile(start_coords, end_coords, samples=256):
             'longitudes': lngs,
             'distance_m': total_distance_m,
             'samples': sample_count,
+            'source': 'google',
         }
     except Exception as exc:
         logger.warning(
@@ -3100,18 +3251,34 @@ def _render_field_strength_image(lons_deg, lats_deg, field_levels,
 
     if horizontal_pattern_db is not None:
         pattern_db = np.asarray(horizontal_pattern_db, dtype=float)
-        pattern_lin = np.power(10.0, np.clip(pattern_db, -60.0, 0.0) / 20.0)
+        if pattern_db.ndim == 0:
+            pattern_db = np.array([pattern_db], dtype=float)
+        pattern_db = np.nan_to_num(pattern_db, nan=-40.0)
+        pattern_db = np.clip(pattern_db, -40.0, 0.0)
+        min_db = float(np.nanmin(pattern_db))
+        max_db = float(np.nanmax(pattern_db))
+        shift = abs(min_db)
+        radius = pattern_db + shift
         polar_dimension = min(fig.get_size_inches()) * 0.35
         inset_left = (1.0 - polar_dimension / fig.get_size_inches()[0]) * 0.5
         inset_bottom = (1.0 - polar_dimension / fig.get_size_inches()[1]) * 0.5
-        ax_inset = fig.add_axes([inset_left, inset_bottom, polar_dimension / fig.get_size_inches()[0],
-                                 polar_dimension / fig.get_size_inches()[1]], polar=True)
+        ax_inset = fig.add_axes(
+            [inset_left, inset_bottom,
+             polar_dimension / fig.get_size_inches()[0],
+             polar_dimension / fig.get_size_inches()[1]],
+            polar=True,
+        )
         ax_inset.set_theta_zero_location('N')
         ax_inset.set_theta_direction(-1)
-        azimutes = np.linspace(0, 2 * np.pi, len(pattern_lin), endpoint=False)
-        ax_inset.plot(azimutes, pattern_lin, linestyle='dashed', label='|E/Emax| (dir. atual)')
-        ax_inset.set_xticks([]); ax_inset.set_yticks([])
+        azimutes = np.linspace(0, 2 * np.pi, len(radius), endpoint=False)
+        ax_inset.plot(azimutes, radius, color='#f50057', linewidth=2)
+        ax_inset.fill_between(azimutes, 0, radius, color='#f50057', alpha=0.08)
+        ax_inset.set_xticks([])
+        ticks_db = np.linspace(min_db, 0.0, 3)
+        ax_inset.set_yticks([t + shift for t in ticks_db])
+        ax_inset.set_yticklabels([f"{t:.0f} dB" for t in ticks_db], fontsize=7)
         ax_inset.spines['polar'].set_visible(False)
+        ax_inset.set_title('Diagrama H (dB)', fontsize=8)
 
     for spine in ax.spines.values():
         spine.set_visible(False)
@@ -3125,7 +3292,10 @@ def _render_field_strength_image(lons_deg, lats_deg, field_levels,
     plt.close(fig)
 
     fig_cb, ax_cb = plt.subplots(figsize=(6, 1))
-    plt.colorbar(mesh, cax=ax_cb, orientation='horizontal')
+    norm = Normalize(vmin=min_val, vmax=max_val)
+    scalar_map = ScalarMappable(norm=norm, cmap=cmap)
+    scalar_map.set_array([])
+    fig_cb.colorbar(scalar_map, cax=ax_cb, orientation='horizontal')
     ax_cb.set_title(colorbar_label)
     fig_cb.tight_layout()
     cb_buffer = io.BytesIO()
@@ -3151,15 +3321,19 @@ def _compute_rt3d_only_map(tx, data, include_arrays=False, label=None, rt3d_scen
         except ValueError:
             return None
 
-    def _determine_auto_scale_local(arr, user_min, user_max):
+    def _determine_auto_scale_local(arr, user_min, user_max, default_min=None, default_max=None):
         arr_np = np.asarray(arr, dtype=float)
         finite_vals = arr_np[np.isfinite(arr_np)]
         if finite_vals.size == 0:
             return (0.0, 1.0)
         auto_min = float(np.nanmin(finite_vals))
         auto_max = float(np.nanmax(finite_vals))
-        vmin = float(user_min) if user_min is not None else auto_min
-        vmax = float(user_max) if user_max is not None else auto_max
+        vmin = float(user_min) if user_min is not None else (
+            float(default_min) if default_min is not None else auto_min
+        )
+        vmax = float(user_max) if user_max is not None else (
+            float(default_max) if default_max is not None else auto_max
+        )
         if abs(vmax - vmin) < 1e-9:
             vmax = vmin + 1.0
         return (vmin, vmax)
@@ -3300,7 +3474,13 @@ def _compute_rt3d_only_map(tx, data, include_arrays=False, label=None, rt3d_scen
     E_plot = _fill_holes(inrange_mask, E_plot)
     Prx_plot = _fill_holes(inrange_mask, Prx_plot)
 
-    min_val, max_val = _determine_auto_scale_local(E_plot, _coerce_optional(data.get('minSignalLevel')), _coerce_optional(data.get('maxSignalLevel')))
+    min_val, max_val = _determine_auto_scale_local(
+        E_plot,
+        _coerce_optional(data.get('minSignalLevel')),
+        _coerce_optional(data.get('maxSignalLevel')),
+        default_min=10.0,
+        default_max=60.0,
+    )
     power_min, power_max = _determine_auto_scale_local(Prx_plot, None, None)
 
     lat_diff = np.abs(lats_deg - lat_tx_deg)
@@ -3351,6 +3531,8 @@ def _compute_rt3d_only_map(tx, data, include_arrays=False, label=None, rt3d_scen
     except Exception:
         pass
 
+    horizontal_pattern_db = gain_comp_raw.get('horizontal_pattern_db')
+
     img_dbuv_b64, colorbar_dbuv_b64 = _render_field_strength_image(
         lons_deg,
         lats_deg,
@@ -3360,7 +3542,7 @@ def _compute_rt3d_only_map(tx, data, include_arrays=False, label=None, rt3d_scen
         lat_tx_deg,
         min_val,
         max_val,
-        None,
+        horizontal_pattern_db,
         dist_map_km=dist_km_grid,
         colorbar_label='Campo elétrico [dBµV/m]'
     )
@@ -3588,6 +3770,16 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "rt3d_rays": _clean_json(coverage_payload.get('rt3dRays')),
         "rt3d_settings": _clean_json(coverage_payload.get('rt3dSettings')),
     }
+    ibge_registry = {}
+    if receivers_payload:
+        for receiver in receivers_payload:
+            ibge_info = receiver.get('ibge') or {}
+            code = ibge_info.get('code') or ibge_info.get('ibge_code')
+            if not code:
+                continue
+            ibge_registry[str(code)] = _clean_json(ibge_info)
+    if ibge_registry:
+        summary_payload["ibge_registry"] = ibge_registry
     if coverage_payload.get('rt3dScene'):
         summary_payload["rt3d_scene"] = _clean_json(coverage_payload.get('rt3dScene'))
     if coverage_payload.get('rt3dDiagnostics'):
@@ -3692,6 +3884,8 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "tx_site_elevation": coverage_payload.get('tx_site_elevation'),
         "tx_parameters": _clean_json(coverage_payload.get('tx_parameters')),
     }
+    if ibge_registry:
+        last_coverage["ibge_registry"] = ibge_registry
     if colorbar_asset:
         last_coverage["colorbar_asset_id"] = str(colorbar_asset.id)
     if coverage_payload.get('rt3dScene'):
@@ -3779,6 +3973,20 @@ def _latest_coverage_snapshot(project: Project | None):
     return summary
 
 
+@bp.route('/relatorios/<slug>')
+@login_required
+def report_editor(slug):
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    snapshot = _latest_coverage_snapshot(project)
+    if snapshot is None:
+        flash('Gere uma cobertura antes de montar o relatório.', 'warning')
+    return render_template(
+        'relatorio.html',
+        project=project,
+        has_snapshot=bool(snapshot),
+    )
+
+
 @bp.route('/projects/<slug>/rt3d-scene.geojson')
 @login_required
 def download_rt3d_scene(slug):
@@ -3863,7 +4071,7 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None, dem_direct
         except ValueError:
             return None
 
-    def _determine_auto_scale_local(arr, user_min, user_max):
+    def _determine_auto_scale_local(arr, user_min, user_max, default_min=None, default_max=None):
         """
         Decide faixa de cores.
         Se user_min/max vierem, respeita.
@@ -3879,8 +4087,12 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None, dem_direct
         auto_min = float(np.nanmin(finite_vals))
         auto_max = float(np.nanmax(finite_vals))
 
-        vmin = float(user_min) if user_min is not None else auto_min
-        vmax = float(user_max) if user_max is not None else auto_max
+        vmin = float(user_min) if user_min is not None else (
+            float(default_min) if default_min is not None else auto_min
+        )
+        vmax = float(user_max) if user_max is not None else (
+            float(default_max) if default_max is not None else auto_max
+        )
 
         if abs(vmax - vmin) < 1e-9:
             vmax = vmin + 1.0
@@ -4335,7 +4547,7 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None, dem_direct
     # -------------------------------------------------
     # 8. ESCALA DE CORES
     # -------------------------------------------------
-    min_val, max_val = _determine_auto_scale_local(E_plot, min_valu, max_valu)
+    min_val, max_val = _determine_auto_scale_local(E_plot, min_valu, max_valu, default_min=10.0, default_max=60.0)
     if min_valu is None and max_valu is None:
         if (not np.isfinite(min_val)) or (not np.isfinite(max_val)):
             min_val, max_val = 10.0, 60.0
@@ -4729,6 +4941,10 @@ def calculate_coverage():
     # Construct the tx_object
     tx_object = _prepare_tx_object(current_user, overrides=all_overrides)
 
+    if receivers:
+        receivers = _enrich_receivers_metadata(receivers, tx_object)
+        data['receivers'] = receivers
+
     dataset_summary = {}
     rt3d_scene_summary = None
     if project and tx_object.latitude is not None and tx_object.longitude is not None:
@@ -4761,6 +4977,8 @@ def calculate_coverage():
 
     dem_directory = dataset_summary.get('dem_dir') if dataset_summary else None
     result = _compute_coverage_map(tx_object, data, dem_directory=dem_directory, rt3d_scene=rt3d_scene_summary)
+    if receivers:
+        result['receivers'] = receivers
     status_payload = result.get('datasetStatus') or {}
     if dataset_summary:
         dem_asset = dataset_summary.get('dem_asset')

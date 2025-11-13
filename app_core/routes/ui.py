@@ -3831,6 +3831,47 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
 
     db.session.flush()
 
+    tile_metadata = None
+    bounds_payload = coverage_payload.get('bounds')
+    if bounds_payload:
+        try:
+            north = float(bounds_payload.get('north'))
+            south = float(bounds_payload.get('south'))
+            east = float(bounds_payload.get('east'))
+            west = float(bounds_payload.get('west'))
+            lon_span = abs(east - west)
+            lat_span = abs(north - south)
+            span = max(lon_span, lat_span, 1e-6)
+            approx_zoom = math.log2(360.0 / span)
+            approx_zoom = max(0.0, min(18.0, approx_zoom))
+            base_zoom = int(round(approx_zoom))
+            min_zoom = max(0, base_zoom - 2)
+            max_zoom = min(22, base_zoom + 4)
+            if max_zoom < min_zoom:
+                max_zoom = min_zoom
+
+            base_tile_url = url_for(
+                'projects.coverage_tile',
+                slug=project.slug,
+                asset_id=str(heatmap_asset.id),
+                z=0,
+                x=0,
+                y=0,
+            )
+            template_url = base_tile_url.replace('/0/0/0.png', '/{z}/{x}/{y}.png')
+            tile_metadata = {
+                "asset_id": str(heatmap_asset.id),
+                "url_template": template_url,
+                "min_zoom": min_zoom,
+                "max_zoom": max_zoom,
+                "bounds": _clean_json(bounds_payload),
+            }
+        except Exception as exc:
+            current_app.logger.warning(
+                'coverage.tiles.metadata_failed',
+                extra={'error': str(exc)},
+            )
+
     summary_payload.update({
         "asset_id": str(heatmap_asset.id),
         "asset_path": heatmap_asset.path,
@@ -3839,6 +3880,9 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
     })
     if colorbar_asset:
         summary_payload["colorbar_asset_id"] = str(colorbar_asset.id)
+
+    if tile_metadata:
+        summary_payload["tiles"] = _clean_json(tile_metadata)
 
     json_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2, default=_json_default))
 
@@ -3888,6 +3932,8 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         last_coverage["ibge_registry"] = ibge_registry
     if colorbar_asset:
         last_coverage["colorbar_asset_id"] = str(colorbar_asset.id)
+    if tile_metadata:
+        last_coverage["tiles"] = _clean_json(tile_metadata)
     if coverage_payload.get('rt3dScene'):
         last_coverage["rt3d_scene"] = _clean_json(coverage_payload.get('rt3dScene'))
     if coverage_payload.get('rt3dDiagnostics'):
@@ -3906,6 +3952,7 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         "colorbar_asset": colorbar_asset,
         "job": job,
         "timestamp": timestamp_iso,
+        "tiles": tile_metadata,
     }
 
 
@@ -5044,11 +5091,19 @@ def calculate_coverage():
                 }
             result['coverage_job_id'] = str(persisted['job'].id)
             result['generated_at'] = persisted['timestamp']
+            if persisted.get('tiles'):
+                result['tiles'] = persisted['tiles']
             if project:
                 result['project_slug'] = project.slug
                 result['lastCoverage'] = _latest_coverage_snapshot(project)
         elif project:
             result['lastCoverage'] = _latest_coverage_snapshot(project)
+
+    if 'tiles' not in result:
+        last_cov = result.get('lastCoverage') or {}
+        tiles_meta = last_cov.get('tiles')
+        if tiles_meta:
+            result['tiles'] = tiles_meta
 
     return jsonify(result)
 

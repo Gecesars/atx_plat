@@ -27,6 +27,7 @@ const state = {
     linkLine: null,
     directionLine: null,
     coverageOverlay: null,
+    tileOverlayLayer: null,
     radiusCircle: null,
     coverageData: null,
     overlayOpacity: OVERLAY_DEFAULT_OPACITY,
@@ -862,7 +863,63 @@ function restoreCoverageFromProject(data) {
     }
 }
 
+function removeTileOverlay() {
+    if (!state.map || !state.tileOverlayLayer) {
+        return;
+    }
+    const overlays = state.map.overlayMapTypes;
+    if (!overlays) {
+        state.tileOverlayLayer = null;
+        return;
+    }
+    for (let i = overlays.getLength() - 1; i >= 0; i -= 1) {
+        if (overlays.getAt(i) === state.tileOverlayLayer) {
+            overlays.removeAt(i);
+            break;
+        }
+    }
+    state.tileOverlayLayer = null;
+}
+
+function applyTileOverlay(tileConfig) {
+    if (!state.map || !tileConfig) {
+        return;
+    }
+    const template = tileConfig.url_template || tileConfig.urlTemplate;
+    if (!template) {
+        return;
+    }
+
+    const minZoom = Number(tileConfig.min_zoom ?? tileConfig.minZoom ?? 3);
+    const maxZoom = Number(tileConfig.max_zoom ?? tileConfig.maxZoom ?? 21);
+
+    removeTileOverlay();
+
+    const layer = new google.maps.ImageMapType({
+        getTileUrl: (coord, zoom) => {
+            const scale = 1 << zoom;
+            const normalizedX = ((coord.x % scale) + scale) % scale;
+            if (coord.y < 0 || coord.y >= scale) {
+                return '';
+            }
+            return template
+                .replace('{z}', zoom)
+                .replace('{x}', normalizedX)
+                .replace('{y}', coord.y);
+        },
+        tileSize: new google.maps.Size(256, 256),
+        opacity: state.overlayOpacity,
+        name: 'CoverageHeatmap',
+        minZoom,
+        maxZoom,
+    });
+
+    state.map.overlayMapTypes.push(layer);
+    state.tileOverlayLayer = layer;
+}
+
 function clearCoverageOverlay() {
+    removeTileOverlay();
     if (state.coverageOverlay) {
         state.coverageOverlay.setMap(null);
         state.coverageOverlay = null;
@@ -876,14 +933,15 @@ function clearCoverageOverlay() {
 function applyCoverageOverlay(response) {
     clearCoverageOverlay();
 
-    const bounds = response.bounds;
-    if (!bounds || !state.map) return;
+    if (!state.map) return;
 
-    // Seleciona imagem e colorbar na unidade preferida
     let overlayImage = response.image || null;
     let colorbarImage = response.colorbar || null;
 
-    if (!overlayImage && response.images) {
+    const tileConfig = response.tiles || response.tile_layer || null;
+    const hasTileLayer = Boolean(tileConfig && (tileConfig.url_template || tileConfig.urlTemplate));
+
+    if (response.images) {
         const availableUnits = Object.keys(response.images);
 
         let preferredUnit = state.coverageUnit && response.images[state.coverageUnit]
@@ -894,44 +952,58 @@ function applyCoverageOverlay(response) {
             preferredUnit = response.scale.default_unit;
         }
 
-        if (!preferredUnit) {
+        if (!preferredUnit && availableUnits.length) {
             preferredUnit = availableUnits[0];
         }
 
-        const unitPayload = response.images[preferredUnit];
-        if (unitPayload) {
-            overlayImage = unitPayload.image;
-            colorbarImage = unitPayload.colorbar;
-            state.coverageUnit = preferredUnit;
+        if (preferredUnit) {
+            const unitPayload = response.images[preferredUnit];
+            if (unitPayload) {
+                if (!overlayImage) {
+                    overlayImage = unitPayload.image;
+                }
+                if (!colorbarImage) {
+                    colorbarImage = unitPayload.colorbar;
+                }
+                state.coverageUnit = preferredUnit;
+            }
         }
     }
 
-    if (!overlayImage) {
-        console.warn('Resposta sem imagem de cobertura disponível.', response);
-        return;
+    if (hasTileLayer) {
+        applyTileOverlay(tileConfig);
+        if (state.coverageData) {
+            state.coverageData.tiles = tileConfig;
+        }
+    } else {
+        const bounds = response.bounds;
+        if (!bounds) {
+            console.warn('Resposta sem limites de cobertura.', response);
+            return;
+        }
+        if (!overlayImage) {
+            console.warn('Resposta sem imagem de cobertura disponível.', response);
+            return;
+        }
+
+        const overlayBounds = new google.maps.LatLngBounds(
+            new google.maps.LatLng(bounds.south, bounds.west),
+            new google.maps.LatLng(bounds.north, bounds.east),
+        );
+
+        const overlay = new google.maps.GroundOverlay(
+            `data:image/png;base64,${overlayImage}`,
+            overlayBounds,
+            { opacity: state.overlayOpacity },
+        );
+        overlay.setMap(state.map);
+        state.coverageOverlay = overlay;
+
+        overlay.addListener('click', (event) => {
+            if (!event || !event.latLng || !state.txCoords) return;
+            createRxMarker(event.latLng);
+        });
     }
-
-    // Bounds do overlay de calor
-    const overlayBounds = new google.maps.LatLngBounds(
-        new google.maps.LatLng(bounds.south, bounds.west),
-        new google.maps.LatLng(bounds.north, bounds.east)
-    );
-
-    // Cria o GroundOverlay (heatmap)
-    const overlay = new google.maps.GroundOverlay(
-        `data:image/png;base64,${overlayImage}`,
-        overlayBounds,
-        { opacity: state.overlayOpacity }
-    );
-    overlay.setMap(state.map);
-    state.coverageOverlay = overlay;
-
-    // >>> NOVO: clique no overlay também cria RX <<<
-    overlay.addListener('click', (event) => {
-        if (!event || !event.latLng) return;
-        if (!state.txCoords) return;
-        createRxMarker(event.latLng);
-    });
 
     // Colorbar lateral
     if (colorbarImage) {
@@ -1054,6 +1126,7 @@ async function loadCoverageOverlay(lastCoverage) {
         rt3dDiagnostics: summary?.rt3d_diagnostics || lastCoverage.rt3d_diagnostics || null,
         rt3dRays: summary?.rt3d_rays || lastCoverage.rt3d_rays || null,
         rt3dSettings: summary?.rt3d_settings || lastCoverage.rt3d_settings || null,
+        tiles: summary?.tiles || lastCoverage.tiles || null,
     };
 
     const centerLat = parseNullableNumber(
@@ -1086,6 +1159,7 @@ async function loadCoverageOverlay(lastCoverage) {
     state.coverageData.receivers = coveragePayload.receivers;
     state.coverageData.signal_level_dict = coveragePayload.signal_level_dict;
     state.coverageData.signal_level_dict_dbm = coveragePayload.signal_level_dict_dbm;
+    state.coverageData.tiles = coveragePayload.tiles || null;
     state.coverageData.project_slug = slug;
     state.coverageData.rt3dScene = coveragePayload.rt3dScene || summary?.rt3d_scene || lastCoverage.rt3d_scene || state.coverageData.rt3dScene || null;
     state.coverageData.rt3dDiagnostics = coveragePayload.rt3dDiagnostics || summary?.rt3d_diagnostics || lastCoverage.rt3d_diagnostics || state.coverageData.rt3dDiagnostics || null;
@@ -1158,6 +1232,13 @@ function setOverlayOpacity(value) {
     state.overlayOpacity = value;
     if (state.coverageOverlay) {
         state.coverageOverlay.setOpacity(value);
+    }
+    if (state.tileOverlayLayer) {
+        if (typeof state.tileOverlayLayer.setOpacity === 'function') {
+            state.tileOverlayLayer.setOpacity(value);
+        } else {
+            state.tileOverlayLayer.set('opacity', value);
+        }
     }
     if (state.radiusCircle) {
         state.radiusCircle.setOptions({ fillOpacity: Math.max(0.05, value / 6) });
@@ -1654,6 +1735,7 @@ function confirmPersistAndGenerate(options = {}) {
             coverageState.scale = data.scale || coverageState.scale;
             coverageState.bounds = data.bounds || coverageState.bounds;
             coverageState.location_status = data.location_status || coverageState.location_status;
+            coverageState.tiles = data.tiles || coverageState.tiles || data.lastCoverage?.tiles || null;
             coverageState.rt3dScene = data.rt3dScene
                 || coverageState.rt3dScene
                 || data.lastCoverage?.rt3d_scene

@@ -5,7 +5,7 @@ import io
 import textwrap
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 import math
 import json
 
@@ -21,6 +21,7 @@ from app_core.models import Asset, AssetType, Project, Report
 from app_core.storage import ensure_project_path_exists, storage_root
 from .ai import build_ai_summary, AIUnavailable, AISummaryError
 from app_core.integrations import ibge as ibge_api
+from app_core.analytics.coverage_ibge import summarize_coverage_demographics
 
 
 MIN_RECEIVER_POWER_DBM = -80.0
@@ -52,7 +53,10 @@ def _format_number(value, unit=""):
 
 
 
-def _estimate_population_impact(snapshot: Dict[str, Any]) -> tuple[list[Dict[str, Any]], int]:
+def _estimate_population_impact(
+    snapshot: Dict[str, Any],
+    allow_remote_lookup: bool = True,
+) -> tuple[list[Dict[str, Any]], int]:
     """
     Estima o impacto populacional filtrando os RX por LIMIAR em dBµV/m (campo elétrico).
     - Usa os campos do RX: 'field_strength_dbuv_m' ou 'field' (strings como "63.3 dBµV/m" são aceitas).
@@ -161,7 +165,7 @@ def _estimate_population_impact(snapshot: Dict[str, Any]) -> tuple[list[Dict[str
         if not demographics and code and registry.get(code):
             demographics = registry.get(code)
 
-        if not demographics:
+        if not demographics and allow_remote_lookup:
             try:
                 demographics = ibge_api.fetch_demographics_by_city(city, state)
             except Exception:
@@ -407,6 +411,33 @@ def _asset_path(asset_id: str | None) -> Path | None:
     return storage_root() / asset.path
 
 
+def _coverage_summary_path(snapshot: Dict[str, Any]) -> Path | None:
+    json_asset_id = snapshot.get('json_asset_id')
+    path = _asset_path(json_asset_id)
+    if path and path.exists():
+        return path
+
+    asset_rel = snapshot.get('asset_path')
+    if asset_rel:
+        candidate = storage_root() / asset_rel
+        if candidate.exists():
+            summary_candidate = candidate.with_name(candidate.name.replace('_field.png', '_summary.json'))
+            if summary_candidate.exists():
+                return summary_candidate
+    return None
+
+
+def _load_coverage_ibge(snapshot: Dict[str, Any], threshold_dbuv: float = 25.0) -> Optional[Dict[str, Any]]:
+    summary_path = _coverage_summary_path(snapshot)
+    if not summary_path:
+        return None
+    try:
+        return summarize_coverage_demographics(summary_path, min_field_dbuvm=threshold_dbuv)
+    except Exception as exc:  # pragma: no cover - proteção adicional
+        current_app.logger.warning('reporting.coverage_ibge_failed', extra={'error': str(exc)})
+        return None
+
+
 def _build_metrics(project: Project, snapshot: Dict[str, Any], center_metrics: Dict[str, Any]) -> Dict[str, Any]:
     settings = project.settings or {}
     user = project.user
@@ -566,7 +597,7 @@ def _draw_table(
 
 
 
-def build_analysis_preview(project: Project) -> Dict[str, Any]:
+def build_analysis_preview(project: Project, *, allow_ibge: bool = True) -> Dict[str, Any]:
     snapshot = _latest_snapshot(project)
     user = project.user
     settings = project.settings or {}
@@ -583,7 +614,9 @@ def build_analysis_preview(project: Project) -> Dict[str, Any]:
 
     receivers_full = snapshot.get('receivers') or []
     link_summary_text, link_payload = _build_link_summary(receivers_full)
+    coverage_ibge = _load_coverage_ibge(snapshot) if allow_ibge else None
     metrics['link_summary'] = link_summary_text
+    metrics['coverage_ibge'] = coverage_ibge
 
     diagram_images = {
         "mancha_de_cobertura": _read_storage_blob(snapshot.get('asset_path')),
@@ -598,7 +631,10 @@ def build_analysis_preview(project: Project) -> Dict[str, Any]:
         raise AnalysisReportError(str(exc)) from exc
 
     receiver_entries = _collect_receiver_entries(snapshot, limit=None)
-    population_details, population_total = _estimate_population_impact(snapshot)
+    population_details, population_total = _estimate_population_impact(
+        snapshot,
+        allow_remote_lookup=allow_ibge,
+    )
 
     heatmap_url = None
     colorbar_url = None
@@ -630,6 +666,7 @@ def build_analysis_preview(project: Project) -> Dict[str, Any]:
             'summary': population_details,
             'total': population_total,
         },
+        'coverage_ibge': coverage_ibge,
         'diagram_images': {
             'perfil': _blob_to_data_uri(diagram_images.get('perfil')),
             'diagrama_horizontal': _blob_to_data_uri(diagram_images.get('diagrama_horizontal')),
@@ -660,11 +697,27 @@ def _format_int(value) -> str:
         return "—"
 
 
+def _format_currency(value) -> str:
+    if value in (None, ""):
+        return "—"
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    formatted = f"{number:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"R$ {formatted}"
 
 
 
 
-def generate_analysis_report(project: Project, overrides: Dict[str, Any] | None = None) -> Report:
+
+
+def generate_analysis_report(
+    project: Project,
+    overrides: Dict[str, Any] | None = None,
+    *,
+    allow_ibge: bool = False,
+) -> Report:
     overrides = overrides or {}
     snapshot = _latest_snapshot(project)
     user = project.user
@@ -725,12 +778,16 @@ def generate_analysis_report(project: Project, overrides: Dict[str, Any] | None 
             ai_sections.setdefault(field, "")
 
     receiver_entries = _collect_receiver_entries(snapshot, limit=None)
-    population_details, population_total = _estimate_population_impact(snapshot)
+    population_details, population_total = _estimate_population_impact(
+        snapshot,
+        allow_remote_lookup=allow_ibge,
+    )
     population_lookup = {
         (row.get('municipality'), row.get('state')): row.get('demographics')
         for row in population_details
         if row.get('demographics')
     }
+    coverage_ibge = _load_coverage_ibge(snapshot) if allow_ibge else None
 
     header_color = overrides.get('header_color') or DEFAULT_HEADER_COLOR
 
@@ -961,6 +1018,52 @@ def generate_analysis_report(project: Project, overrides: Dict[str, Any] | None 
                 c.drawString(40, y, "Demografia detalhada por município (cont.)")
                 y -= 18
                 c.setFont('Helvetica', 9)
+
+    coverage_ibge_municipalities = (coverage_ibge or {}).get('municipalities') if coverage_ibge else []
+    if coverage_ibge_municipalities:
+        y = _ensure_space(c, y, 160, width, height, "Enlaces e impacto populacional (cont.)", project.slug, header_color)
+        c.setFont('Helvetica-Bold', 11)
+        c.drawString(40, y, f"Municípios com campo ≥ {int((coverage_ibge or {}).get('threshold_dbuv', 25))} dBµV/m")
+        y -= 18
+        coverage_columns = [
+            ("Município/UF", 150),
+            ("Campo máx (dBµV/m)", 100),
+            ("População", 90),
+            ("Ano Pop", 60),
+            ("Renda per capita", 120),
+            ("Ano Renda", 70),
+        ]
+        coverage_rows: List[List[str]] = []
+        for entry in coverage_ibge_municipalities:
+            city_state = f"{entry.get('municipality') or '—'} / {entry.get('state') or '—'}"
+            field_val = entry.get('max_field_dbuvm')
+            field_text = f"{field_val:.1f}" if isinstance(field_val, (int, float)) else "—"
+            pop_text = _format_int(entry.get('population'))
+            pop_year = entry.get('population_year')
+            pop_year_text = str(pop_year) if pop_year else "—"
+            income_text = _format_currency(entry.get('income_per_capita'))
+            income_year = entry.get('income_year')
+            income_year_text = str(income_year) if income_year else "—"
+            coverage_rows.append([
+                city_state,
+                field_text,
+                pop_text,
+                pop_year_text,
+                income_text,
+                income_year_text,
+            ])
+        y = _draw_table(
+            c,
+            y,
+            coverage_columns,
+            coverage_rows,
+            width,
+            height,
+            project.slug,
+            "Municípios com campo ≥ 25 dBµV/m (cont.)",
+            theme_color=header_color,
+        )
+        y -= 6
 
     link_analysis_map = {}
     for item in ai_sections.get("link_analyses") or []:

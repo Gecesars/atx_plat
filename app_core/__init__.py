@@ -1,4 +1,5 @@
 import os
+import platform
 from datetime import datetime
 from pathlib import Path
 
@@ -10,6 +11,8 @@ from flask_migrate import Migrate
 from extensions import db, login_manager
 from user import User
 from app_core import models  # noqa: F401
+from sqlalchemy import event
+from sqlalchemy.engine import Engine
 
 
 BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
@@ -38,6 +41,15 @@ def create_app():
         uri = uri.replace("postgres://", "postgresql://", 1)
     app.config['SQLALCHEMY_DATABASE_URI'] = uri
     app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+    # Workaround Windows/psycopg2 UnicodeDecodeError on non-UTF8 server messages:
+    # 1) Decode pre-auth messages with LATIN1 to avoid crashes
+    # 2) On Windows, force lc_messages=C (ASCII) and client_encoding=UTF8 after connect
+    os.environ.setdefault("PGCLIENTENCODING", "LATIN1")
+    engine_options = app.config.setdefault('SQLALCHEMY_ENGINE_OPTIONS', {})
+    connect_args = engine_options.setdefault("connect_args", {})
+    if "options" not in connect_args and platform.system() == "Windows":
+        # psycopg2 accepts "options" to send -c switches to the server
+        connect_args["options"] = "-c lc_messages=C"
 
     # Feature flags & security
     app.config['ALLOW_UNCONFIRMED'] = _env_bool('ALLOW_UNCONFIRMED', False)
@@ -88,6 +100,24 @@ def create_app():
     app.register_blueprint(regulator_api_bp)
     from app_core.reporting.api import bp as reporting_api_bp
     app.register_blueprint(reporting_api_bp)
+
+    # Post-connect fix: ensure UTF8 client encoding and ASCII messages
+    @event.listens_for(Engine, "connect")
+    def _set_pg_encoding(dbapi_connection, connection_record):
+        if platform.system() != "Windows":
+            return
+        try:
+            cur = dbapi_connection.cursor()
+            # Ensure ASCII messages and UTF8 client encoding after auth
+            cur.execute("SET lc_messages TO 'C'")
+            cur.execute("SET client_encoding TO 'UTF8'")
+            cur.close()
+        except Exception:
+            # Ignore if not PostgreSQL or not yet available
+            try:
+                dbapi_connection.rollback()
+            except Exception:
+                pass
 
     @app.context_processor
     def inject_defaults():

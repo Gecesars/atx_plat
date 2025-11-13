@@ -41,7 +41,21 @@ def analysis_context():
         return jsonify({'error': 'Informe o slug do projeto.'}), 400
     project = project_by_slug_or_404(slug, current_user.uuid)
     try:
-        context = build_analysis_preview(project)
+        context = build_analysis_preview(project, allow_ibge=False)
     except AnalysisReportError as exc:
         return jsonify({'error': str(exc)}), 400
     return jsonify(context), 200
+
+
+@bp.route('/coverage_ibge', methods=['GET'])
+@login_required
+def coverage_ibge_summary():
+    slug = request.args.get('project') or request.args.get('projectSlug')
+    if not slug:
+        return jsonify({'error': 'Informe o slug do projeto.'}), 400
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    try:
+        context = build_analysis_preview(project, allow_ibge=False)
+    except AnalysisReportError as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify(context.get('coverage_ibge') or {}), 200

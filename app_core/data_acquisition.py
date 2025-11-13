@@ -249,6 +249,68 @@ def ensure_geodata_availability(project, latitude=None, longitude=None, lulc_yea
     if project is None:
         return summary
 
+    def _latest_asset(asset_type):
+        return (
+            Asset.query
+            .filter_by(project_id=project.id, type=asset_type)
+            .order_by(Asset.created_at.desc())
+            .first()
+        )
+
+    dem_asset = None
+    if latitude is not None and longitude is not None:
+        try:
+            dem_asset = download_srtm_tile(project, latitude, longitude)
+        except Exception as exc:
+            current_app.logger.warning(
+                "geodata.dem.download_failed",
+                extra={"project": getattr(project, "slug", None), "error": str(exc)},
+            )
+            dem_asset = None
+
+    if dem_asset is None:
+        dem_asset = _latest_asset(AssetType.dem)
+    summary['dem_asset'] = dem_asset
+
+    existing_lulc = _latest_asset(AssetType.lulc)
+    if existing_lulc:
+        summary['lulc_asset'] = existing_lulc
+        summary['lulc_year'] = (existing_lulc.meta or {}).get('year')
+
+    if fetch_lulc:
+        target_year = _normalize_mapbiomas_year(lulc_year)
+        if target_year is None:
+            if summary['lulc_year'] is not None:
+                target_year = _normalize_mapbiomas_year(summary['lulc_year'])
+            else:
+                current_year = datetime.utcnow().year - 1
+                target_year = _normalize_mapbiomas_year(current_year)
+
+        if target_year is not None:
+            needs_download = (
+                summary['lulc_asset'] is None
+                or summary.get('lulc_year') != target_year
+            )
+            if needs_download:
+                try:
+                    lulc_asset = download_mapbiomas_tile(project, target_year)
+                except Exception as exc:
+                    current_app.logger.warning(
+                        "geodata.lulc.download_failed",
+                        extra={
+                            "project": getattr(project, "slug", None),
+                            "year": target_year,
+                            "error": str(exc),
+                        },
+                    )
+                    lulc_asset = None
+                else:
+                    if lulc_asset:
+                        summary['lulc_asset'] = lulc_asset
+                        summary['lulc_year'] = target_year
+
+    return summary
+
 
 def _coerce_float(value):
     try:
@@ -548,17 +610,3 @@ def ensure_rt3d_scene(
         extra={"project": project.slug, "feature_count": result["feature_count"]},
     )
     return result
-
-    if latitude is not None and longitude is not None:
-        summary['dem_asset'] = download_srtm_tile(project, latitude, longitude)
-
-    if fetch_lulc:
-        year = _normalize_mapbiomas_year(lulc_year)
-        if year is None:
-            current_year = datetime.utcnow().year - 1
-            year = _normalize_mapbiomas_year(current_year)
-        if year is not None:
-            summary['lulc_asset'] = download_mapbiomas_tile(project, year)
-            summary['lulc_year'] = year
-
-    return summary

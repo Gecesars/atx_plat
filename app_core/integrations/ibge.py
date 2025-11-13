@@ -92,17 +92,25 @@ STATE_ALIASES = {
 }
 
 
-def _log(event: str, **extra):
+def _log(event: str, level: int = logging.WARNING, **extra):
     """Logger seguro (funciona dentro/fora do contexto Flask)."""
-    print("logger")
+    logger = logging.getLogger("ibge_service")
     try:
-        current_app.logger.warning(event, extra=extra)
+        logger = current_app.logger  # type: ignore[assignment]
     except Exception:
-        logging.getLogger("ibge_service").warning("%s %s", event, extra)
+        pass
+
+    if level <= logging.DEBUG:
+        logger.debug(event, extra=extra)
+    elif level == logging.INFO:
+        logger.info(event, extra=extra)
+    elif level >= logging.ERROR:
+        logger.error(event, extra=extra)
+    else:
+        logger.warning(event, extra=extra)
 
 
 def _slugify(value: str) -> str:
-    print("slugify")
     normalized = unicodedata.normalize("NFKD", value or "")
     ascii_text = normalized.encode("ascii", "ignore").decode("ascii").lower()
     for old, new in (("state of ", ""), ("estado de ", "")):
@@ -112,8 +120,6 @@ def _slugify(value: str) -> str:
 
 
 def normalize_state_code(value: str | None) -> str | None:
-    print("normalize_state_code")
-
     if not value:
         return None
     v = value.strip()
@@ -134,8 +140,6 @@ def _safe_parse_numeric(value) -> int | None:
 
 
 def _build_demographics_url(code: str, classificacoes: Optional[dict[int, Iterable[int]]] = None) -> str:
-    print("build_demographics_url")
-
     """
     Monta a URL da variável 93 para um município N6[code], opcionalmente
     adicionando parâmetros de classificação, e.g.:
@@ -160,8 +164,6 @@ def _build_demographics_url(code: str, classificacoes: Optional[dict[int, Iterab
 
 @lru_cache(maxsize=2048)
 def resolve_municipality_code(city: str | None, state: str | None = None) -> str | None:
-    print("resolve_municipality_code")
-
     if not city:
         return None
     # normaliza a consulta para melhor acerto/cache
@@ -197,8 +199,6 @@ def resolve_municipality_code(city: str | None, state: str | None = None) -> str
 
 
 def _parse_total_from_payload(payload) -> Optional[int]:
-    print("parse_total_from_payload")
-
     """
     Lê o 'total' (sem classificação) quando presente no payload padrão da 9514.
     """
@@ -215,7 +215,6 @@ def _parse_total_from_payload(payload) -> Optional[int]:
                 for raw in (serie.get("serie") or {}).values():
                     val = _safe_parse_numeric(raw)
                     if val is not None:
-                        print("returning total:", val)
                         return val
     return None
 
@@ -269,7 +268,6 @@ def _parse_breakdown(payload, target_class_name: str) -> Dict[str, int]:
                 continue
             label = (meta.get("categories") or {}).get(category_id, str(category_id))
             out[label] = out.get(label, 0) + value
-    print("breakdown:", out)
     return out
 
 
@@ -325,10 +323,6 @@ def fetch_demographics_by_code(code: str | None) -> Dict[str, Any] | None:
     # Se nada deu certo:
     if total is None and not sex_breakdown and not age_breakdown:
         return None
-    print("returning demographics for code:", code)
-    print("total:", total)
-    print("sex:", sex_breakdown)
-    print("age:", age_breakdown)
     return {
         "code": code,
         "total": total,
@@ -366,7 +360,6 @@ def fetch_population_legacy(code: str | None) -> int | None:
         if value not in (None, "")
     ]
     values = [v for v in values if v is not None]
-    print("legacy population values:", values)
     return values[-1] if values else None
 
 
@@ -380,6 +373,4 @@ def fetch_demographics_by_city(city: str | None, state: str | None = None) -> Di
     total = fetch_population_legacy(code)
     if total is None:
         return None
-    print("returning demographics for city:", city, state)
-    print("total:", total)
     return {"code": code, "total": total, "sex": {}, "age": {}, "raw": None}

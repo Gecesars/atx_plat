@@ -14,7 +14,7 @@
             <p class="panel-subtitle">Ajuste parâmetros, visualize o enlace e acompanhe o perfil profissional.</p>
         </header>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Resumo consolidado da estação transmissora ativa.">
             <h3 class="card-title">Estação Transmissora</h3>
             <dl class="card-grid" id="txSummary">
                 <div>
@@ -49,9 +49,9 @@
             <p class="assist-text" id="txClimateInfo">Clima não ajustado para esta localização</p>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Defina a malha da cobertura, faixa de campo e unidade de visualização.">
             <h3 class="card-title">Cobertura</h3>
-            <label class="form-label" for="radiusInput">Raio de análise (km)</label>
+            <label class="form-label" for="radiusInput" data-bs-toggle="tooltip" title="Distância radial máxima a partir da TX considerada na predição.">Raio de análise (km)</label>
             <div class="input-group">
                 <input type="range" id="radiusInput" min="5" max="150" step="5" value="30">
                 <span class="input-value" id="radiusValue">30 km</span>
@@ -59,42 +59,42 @@
 
             <div class="dual-input">
                 <div>
-                    <label class="form-label" for="minField">Min dBµV/m</label>
+                    <label class="form-label" for="minField" data-bs-toggle="tooltip" title="Valor mínimo da escala de cores exibida na mancha.">Min dBµV/m</label>
                     <input type="number" id="minField" placeholder="auto" step="0.1">
                 </div>
                 <div>
-                    <label class="form-label" for="maxField">Max dBµV/m</label>
+                    <label class="form-label" for="maxField" data-bs-toggle="tooltip" title="Valor máximo da escala de cores exibida na mancha.">Max dBµV/m</label>
                     <input type="number" id="maxField" placeholder="auto" step="0.1">
                 </div>
             </div>
 
             <div class="unit-toggle-group" role="group" aria-label="Unidade da escala">
-                <button type="button" class="btn btn-sm btn-outline-primary active" id="unitDbuv" aria-pressed="true" data-disabled-during-coverage>Campo dBµV/m</button>
-                <button type="button" class="btn btn-sm btn-outline-primary" id="unitDbm" aria-pressed="false" data-disabled-during-coverage>Potência dBm</button>
+                <button type="button" class="btn btn-sm btn-outline-primary active" id="unitDbuv" aria-pressed="true" data-disabled-during-coverage data-bs-toggle="tooltip" title="Visualizar a malha em campo elétrico (dBµV/m).">Campo dBµV/m</button>
+                <button type="button" class="btn btn-sm btn-outline-primary" id="unitDbm" aria-pressed="false" data-disabled-during-coverage data-bs-toggle="tooltip" title="Visualizar a malha em potência recebida (dBm).">Potência dBm</button>
             </div>
 
-            <button class="btn btn-brand w-100" id="btnGenerateCoverage">Gerar cobertura</button>
+            <button class="btn btn-brand w-100" id="btnGenerateCoverage" data-bs-toggle="tooltip" title="Executar o motor de propagação com os parâmetros atuais.">Gerar cobertura</button>
             <div class="coverage-status-badge" id="coverageStatus" hidden></div>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Ajuste de transparência e guias visuais do mapa.">
             <h3 class="card-title">Visualização</h3>
             <p class="assist-text">Arraste o marcador vermelho para reposicionar a TX. A região circular acompanha o raio selecionado.</p>
             <div class="slider-row">
-                <label class="form-label" for="overlayOpacity">Transparência</label>
+                <label class="form-label" for="overlayOpacity" data-bs-toggle="tooltip" title="Controla a opacidade da imagem de cobertura sobre o mapa.">Transparência</label>
                 <input type="range" id="overlayOpacity" min="0.1" max="1" step="0.05">
                 <span id="overlayOpacityValue">0.85</span>
             </div>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Defina tilt elétrico e azimute de irradiação da antena.">
             <h3 class="card-title">Ajustes de Antena</h3>
-            <label class="form-label" for="tiltControl">Tilt elétrico TX (°)</label>
+            <label class="form-label" for="tiltControl" data-bs-toggle="tooltip" title="Inclinação elétrica aplicada ao feixe principal.">Tilt elétrico TX (°)</label>
             <div class="input-group">
                 <input type="range" id="tiltControl" min="-10" max="30" step="0.5" value="0">
                 <span class="input-value" id="tiltValue">0°</span>
             </div>
-            <label class="form-label" for="directionControl">Azimute da antena (°)</label>
+            <label class="form-label" for="directionControl" data-bs-toggle="tooltip" title="Direção principal (em graus) do lóbulo principal.">Azimute da antena (°)</label>
             <div class="input-group">
                 <input type="range" id="directionControl" min="0" max="359" step="1" value="0">
                 <span class="input-value" id="directionValue">0°</span>
@@ -102,7 +102,7 @@
             <p class="assist-text">O ganho vertical é recalculado em E/Emax (θ = 0°) e o diagrama horizontal é alinhado ao azimute informado.</p>
         </div>
 
-        <div class="panel-card" id="rt3dPanel" hidden>
+        <div class="panel-card" id="rt3dPanel" hidden data-bs-toggle="tooltip" title="Painel dedicado ao motor Ray Tracing 3D.">
             <div class="d-flex align-items-center justify-content-between flex-wrap gap-2">
                 <div>
                     <h3 class="card-title mb-1">Cenário urbano RT3D</h3>
@@ -129,27 +129,27 @@
                 </div>
             </dl>
             <div class="d-flex align-items-center gap-2">
-                <button type="button" class="btn btn-outline-primary btn-sm flex-grow-1" id="toggleRt3dLayer" data-disabled-during-coverage>Ocultar malha urbana</button>
+                <button type="button" class="btn btn-outline-primary btn-sm flex-grow-1" id="toggleRt3dLayer" data-disabled-during-coverage data-bs-toggle="tooltip" title="Exibe ou oculta o modelo urbano extrudado.">Ocultar malha urbana</button>
                 <button type="button" class="btn btn-outline-secondary btn-sm" id="refreshRt3dLayer" data-bs-toggle="tooltip" title="Recarrega a malha urbana usando os parâmetros atuais." data-disabled-during-coverage>Atualizar cena</button>
-                <button type="button" class="btn btn-outline-primary btn-sm" id="toggleRt3dRays" data-disabled-during-coverage>Ocultar raios</button>
+                <button type="button" class="btn btn-outline-primary btn-sm" id="toggleRt3dRays" data-disabled-during-coverage data-bs-toggle="tooltip" title="Controla a visualização dos raios traçados.">Ocultar raios</button>
             </div>
             <div class="d-flex align-items-center gap-2">
-                <a class="btn btn-sm btn-brand flex-grow-1" id="openRt3dViewer" target="_blank" rel="noopener">Abrir em 3D (Cesium)</a>
-                <a class="btn btn-sm btn-outline-primary" id="downloadRt3dGeojson" target="_blank" rel="noopener">Exportar GeoJSON</a>
+                <a class="btn btn-sm btn-brand flex-grow-1" id="openRt3dViewer" target="_blank" rel="noopener" data-bs-toggle="tooltip" title="Abre uma nova aba com a visualização Cesium/3D.">Abrir em 3D (Cesium)</a>
+                <a class="btn btn-sm btn-outline-primary" id="downloadRt3dGeojson" target="_blank" rel="noopener" data-bs-toggle="tooltip" title="Baixa o GeoJSON da cena urbana atual.">Exportar GeoJSON</a>
             </div>
             <p class="assist-text mb-0" id="rt3dStatus">Gere a cobertura com o motor RT3D para popular este painel.</p>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Lista os pontos RX adicionados ao mapa.">
             <div class="d-flex justify-content-between align-items-center">
                 <h3 class="card-title mb-0">Recepções</h3>
-                <button class="btn btn-sm btn-outline-secondary" type="button" id="btnClearRx">Limpar</button>
+                <button class="btn btn-sm btn-outline-secondary" type="button" id="btnClearRx" data-bs-toggle="tooltip" title="Remove todos os receptores desenhados.">Limpar</button>
             </div>
             <p class="assist-text">Clique no mapa para adicionar pontos RX. Toque em um item para focar ou gerar perfil.</p>
             <ul class="rx-list" id="rxList"></ul>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Ganho base e ajustes aplicados ao padrão da antena.">
             <h3 class="card-title">Resumo de Ganho</h3>
             <dl class="card-grid" id="gainSummary">
                 <div>
@@ -171,7 +171,7 @@
             </dl>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Visualize os componentes principais de perda do modelo P.452.">
             <h3 class="card-title">Perdas P.452</h3>
             <dl class="card-grid loss-grid" id="lossSummary">
                 <div>
@@ -202,7 +202,7 @@
             <p class="assist-text" id="pathTypeInfo"></p>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Mostra os parâmetros calculados no ponto central da mancha.">
             <h3 class="card-title">Referência Central</h3>
             <dl class="card-grid" id="centerSummary">
                 <div>
@@ -232,10 +232,10 @@
             </dl>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Acompanhe o status da geração de perfis automáticos.">
             <h3 class="card-title">Perfil Profissional</h3>
             <p class="assist-text">Cada RX gera automaticamente um perfil com Fresnel, curvatura e perdas. Selecione-o na lista para visualizar ou atualizar.</p>
-            <button class="btn btn-outline-primary w-100" id="btnGenerateProfile" disabled>Ver perfil selecionado</button>
+            <button class="btn btn-outline-primary w-100" id="btnGenerateProfile" disabled data-bs-toggle="tooltip" title="Abre o perfil armazenado do receptor destacado.">Ver perfil selecionado</button>
             <div class="text-center mt-3" id="profileSpinner" hidden>
                 <div class="spinner-border text-primary" role="status">
                     <span class="visually-hidden">Gerando perfil do enlace...</span>
@@ -243,7 +243,7 @@
             </div>
         </div>
 
-        <div class="panel-card">
+        <div class="panel-card" data-bs-toggle="tooltip" title="Estatísticas do enlace TX→RX atualmente selecionado.">
             <h3 class="card-title">Ligação TX ↔ RX</h3>
             <dl class="card-grid" id="linkSummary">
                 <div>
@@ -265,7 +265,7 @@
             </dl>
         </div>
 
-        <div class="colorbar-card" id="colorbarCard" hidden>
+        <div class="colorbar-card" id="colorbarCard" hidden data-bs-toggle="tooltip" title="Barra de cores referente à escala atual da mancha.">
             <span class="colorbar-label" id="colorbarLabel">Campo elétrico [dBµV/m]</span>
             <img id="colorbarImage" alt="Colorbar cobertura" />
         </div>

@@ -75,6 +75,7 @@ Requisitos:
   1. Forneça uma análise específica (distância, campo, potência).
   2. Verifique se os níveis de sinal são coerentes com a ERP 'A' (em dBm) calculada.
   3. **Crucial:** Compare o campo/potência do receptor (listado em {link_payload}) com qualquer valor de campo/potência estimado na análise do 'profile' (se disponível para esse receptor) e aponte explicitamente qualquer discrepância (ex: "Campo no perfil é 70.8 dBµV/m, mas no receptor é 63.3 dBµV/m").
+- Utilize 25 dBµV/m como limiar mínimo de cobertura aceitável; destaque quando um receptor ficar abaixo desse valor e proponha correção.
 - Caso não haja perfil/imagem para um receptor, explicite "Dados indisponíveis" mas mantenha a entrada no array.
 - Ao comentar os diagramas horizontal/vertical, cite se o sistema é omni ou direcional com base na análise visual da imagem.
 - Utilize o resumo de receptores para avaliar cada enlace no campo profile/conclusion, apontando discrepâncias de campo/potência.
@@ -184,7 +185,7 @@ def build_ai_summary(
         recs = [item.strip() for item in recs.split("\n") if item.strip()]
     if not isinstance(recs, list):
         raise AISummaryError("Campo 'recommendations' deveria ser uma lista.")
-    summary["recommendations"] = recs[:2] if recs else []
+    summary["recommendations"] = recs if recs else []
     link_analyses = summary.get("link_analyses") or []
     if isinstance(link_analyses, dict):
         link_analyses = [link_analyses]

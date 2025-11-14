@@ -25,6 +25,7 @@ from app_core.analytics.coverage_ibge import summarize_coverage_demographics
 
 
 MIN_RECEIVER_POWER_DBM = -80.0
+MIN_FIELD_DBUV = 25.0
 MAX_RECEIVER_ROWS = 8
 MAX_POP_LOOKUPS = 5
 DEFAULT_HEADER_COLOR = "#0d47a1"
@@ -247,6 +248,9 @@ def _blob_to_data_uri(blob: bytes | None) -> str | None:
 
 
 def _render_receiver_profile_plot(receiver: Dict[str, Any]) -> bytes | None:
+    asset_blob = _load_profile_asset(receiver)
+    if asset_blob:
+        return asset_blob
     profile = receiver.get('profile') or {}
     elevations = profile.get('elevations_m') or []
     if not elevations or len(elevations) < 2:
@@ -283,6 +287,35 @@ def _render_receiver_profile_plot(receiver: Dict[str, Any]) -> bytes | None:
     plt.close(fig)
     buffer.seek(0)
     return buffer.read()
+
+
+def _load_profile_asset(receiver: Dict[str, Any]) -> bytes | None:
+    candidate_path = receiver.get('profile_asset_path')
+    if candidate_path:
+        path = storage_root() / candidate_path
+        if path.exists():
+            try:
+                return path.read_bytes()
+            except OSError:
+                pass
+    asset_id = receiver.get('profile_asset_id')
+    if asset_id:
+        asset = Asset.query.filter_by(id=asset_id).first()
+        if asset:
+            path = storage_root() / asset.path
+            if path.exists():
+                try:
+                    return path.read_bytes()
+                except OSError:
+                    pass
+    inline = receiver.get('profile_image')
+    if inline:
+        try:
+            base64_data = inline.split(',', 1)[-1]
+            return base64.b64decode(base64_data)
+        except Exception:
+            return None
+    return None
 
 
 def _build_link_summary(receivers: list[Dict[str, Any]]) -> tuple[str, list[Dict[str, Any]]]:
@@ -438,6 +471,21 @@ def _load_coverage_ibge(snapshot: Dict[str, Any], threshold_dbuv: float = 25.0) 
         return None
 
 
+def _format_user_climate(user) -> str | None:
+    parts = []
+    if getattr(user, "temperature_k", None):
+        temp_c = float(user.temperature_k) - 273.15
+        parts.append(f"Temperatura {temp_c:.1f} °C")
+    if getattr(user, "pressure_hpa", None):
+        parts.append(f"Pressão {float(user.pressure_hpa):.0f} hPa")
+    if getattr(user, "water_density", None):
+        parts.append(f"Umidade abs. {float(user.water_density):.1f} g/m³")
+    if not parts:
+        return None
+    text = " / ".join(parts)
+    if getattr(user, "climate_updated_at", None):
+        text += f" (amostrado em {user.climate_updated_at:%d/%m/%Y})"
+    return text
 def _build_metrics(project: Project, snapshot: Dict[str, Any], center_metrics: Dict[str, Any]) -> Dict[str, Any]:
     settings = project.settings or {}
     user = project.user
@@ -453,6 +501,12 @@ def _build_metrics(project: Project, snapshot: Dict[str, Any], center_metrics: D
             erp_dbm = 10 * math.log10(max(float(power_w), 1e-6) * 1000.0)
         except (TypeError, ValueError):
             erp_dbm = None
+    climate_text = (
+        settings.get("clima")
+        or snapshot.get("climate_status")
+        or _format_user_climate(user)
+        or "Não informado"
+    )
     return {
         "service": settings.get("serviceType") or getattr(user, "servico", "Radiodifusão"),
         "service_class": settings.get("serviceClass") or settings.get("classe") or "—",
@@ -466,7 +520,7 @@ def _build_metrics(project: Project, snapshot: Dict[str, Any], center_metrics: D
         "loss_center": center_metrics.get("combined_loss_center_db"),
         "gain_center": center_metrics.get("effective_gain_center_db"),
         "horizontal_peak_to_peak_db": _horizontal_peak_to_peak_db(user),
-        "climate": settings.get("clima") or snapshot.get("climate_status") or "Não informado",
+        "climate": climate_text,
         # === CHAVES ADICIONADAS QUE CAUSAVAM O ERRO ===
         "tx_power_w": power_w,
         "antenna_gain_dbi": gain_dbi,
@@ -486,13 +540,24 @@ def _receiver_power_dbm(receiver: Dict[str, Any]) -> float | None:
     return None
 
 
+def _receiver_field_dbuv(receiver: Dict[str, Any]) -> float | None:
+    for key in ("field_strength_dbuv_m", "field_dbuv", "field", "field_dbuv_m"):
+        value = receiver.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
 def _collect_receiver_entries(snapshot: Dict[str, Any], limit: int | None = MAX_RECEIVER_ROWS) -> list[Dict[str, Any]]:
     receivers = snapshot.get('receivers') or []
     entries: list[Dict[str, Any]] = []
     for rx in receivers:
         power = _receiver_power_dbm(rx)
-        if power is None or power < MIN_RECEIVER_POWER_DBM:
-            continue
+        field = _receiver_field_dbuv(rx)
         location = rx.get('location') or {}
         municipality = rx.get('municipality') or location.get('municipality') or location.get('city')
         state = rx.get('state') or location.get('state') or location.get('uf')
@@ -511,10 +576,17 @@ def _collect_receiver_entries(snapshot: Dict[str, Any], limit: int | None = MAX_
             "state": state,
             "power_dbm": power,
             "distance_km": distance,
+            "field_dbuv_m": field,
+            "altitude_m": rx.get('altitude_m') or location.get('altitude'),
+            "quality": rx.get('quality') or rx.get('status'),
+            "meets_field_min": field is not None and field >= MIN_FIELD_DBUV,
             "demographics": demographics,
             "ibge_code": ibge_info.get('code') or ibge_info.get('ibge_code'),
         })
-    entries.sort(key=lambda item: item['power_dbm'], reverse=True)
+    entries.sort(
+        key=lambda item: item['power_dbm'] if item.get('power_dbm') is not None else MIN_RECEIVER_POWER_DBM,
+        reverse=True,
+    )
     if limit is None:
         return entries
     return entries[:limit]
@@ -808,6 +880,19 @@ def generate_analysis_report(
         header_color,
     )
 
+    primary_rx = receiver_entries[0] if receiver_entries else None
+    primary_rx_loss = None
+    primary_rx_label = None
+    if primary_rx:
+        try:
+            erp_value = float(metrics.get("erp_dbm")) if metrics.get("erp_dbm") is not None else None
+            rx_power = float(primary_rx.get('power_dbm')) if primary_rx.get('power_dbm') is not None else None
+            if erp_value is not None and rx_power is not None:
+                primary_rx_loss = erp_value - rx_power
+                primary_rx_label = primary_rx.get('label') or 'RX'
+        except (TypeError, ValueError):
+            primary_rx_loss = None
+
     left_column = [
         ('Projeto', project.name),
         ('Slug', project.slug),
@@ -822,19 +907,20 @@ def generate_analysis_report(
         ('Ganho TX', _format_number(getattr(user, 'antenna_gain', None), 'dBi')),
         ('Perdas Sistêmicas', _format_number(getattr(user, 'total_loss', None), 'dB')),
         ('Polarização', getattr(user, 'polarization', '—')),
-        ('Campo no centro', _format_number(center_metrics.get('field_center_dbuv_m'), 'dBµV/m')),
         ('Potência recebida', _format_number(center_metrics.get('received_power_center_dbm'), 'dBm')),
         ('Perda combinada', _format_number(center_metrics.get('combined_loss_center_db'), 'dB')),
         ('Ganho efetivo', _format_number(center_metrics.get('effective_gain_center_db'), 'dB')),
-        ('Componente L_b', _format_number((loss_components.get('L_b') or {}).get('center'), 'dB')),
+        ('L_b (centro)', _format_number((loss_components.get('L_b') or {}).get('center'), 'dB')),
         ('Ajuste horizontal', _format_number(gain_components.get('horizontal_adjustment_db_min'), 'dB')),
         ('Ajuste vertical', _format_number(gain_components.get('vertical_adjustment_db'), 'dB')),
         ('Pico a pico (H)', _format_number(metrics.get('horizontal_peak_to_peak_db'), 'dB')),
     ]
+    if primary_rx_label and primary_rx_loss is not None:
+        right_column.append((f'Atenuação até {primary_rx_label}', _format_number(primary_rx_loss, 'dB')))
     y = _draw_columns(c, y, [
         (40, left_column),
         (320, right_column),
-    ]) - 10
+    ]) - 18
 
     notes_text = metrics.get("project_notes")
     if notes_text:
@@ -928,66 +1014,50 @@ def generate_analysis_report(
     c.drawString(40, y, f"Receptores avaliados (≥ {int(MIN_RECEIVER_POWER_DBM)} dBm)")
     y -= 18
 
-    receiver_rows = []
-    for entry in receiver_entries:
+    for idx, entry in enumerate(receiver_entries, 1):
+        y = _ensure_space(c, y, 130, width, height, "Receptores avaliados (cont.)", project.slug, header_color)
+        label = entry.get('label') or f"Receptor {idx}"
+        c.setFont('Helvetica-Bold', 10)
+        c.drawString(40, y, label)
+        y -= 12
+        municipality = entry.get('municipality') or '—'
+        state = entry.get('state') or '—'
+        distance_text = _format_number(entry.get('distance_km'), 'km')
+        field_text = _format_number(entry.get('field_dbuv_m'), 'dBµV/m')
+        power_text = _format_number(entry.get('power_dbm'), 'dBm')
+        altitude_text = _format_number(entry.get('altitude_m'), 'm')
+        quality_text = entry.get('quality') or '—'
+        compliance = "Atende (>=25 dBµV/m)" if entry.get('meets_field_min') else "Abaixo de 25 dBµV/m"
+        info_lines = [
+            ("Município/UF", f"{municipality} / {state}"),
+            ("Distância", distance_text),
+            ("Campo", field_text),
+            ("Potência", power_text),
+            ("Altitude RX", altitude_text),
+            ("Conformidade", compliance),
+            ("Qualidade", quality_text),
+        ]
+        y = _draw_text_block(c, 50, y, info_lines)
         key = (entry.get('municipality'), entry.get('state'))
         demo = population_lookup.get(key) or {}
         pop_value = demo.get('total')
         sex_dom = _dominant_category(demo.get('sex') or {})
         age_dom = _dominant_category(demo.get('age') or {})
-        population_text = _format_int(pop_value)
+        demography_text = ""
+        if pop_value:
+            demography_text += f"População estimada: {_format_int(pop_value)}."
         if sex_dom[0]:
-            sex_text = f"{sex_dom[0]} ({sex_dom[1]:.1f}%)" if sex_dom[1] is not None else sex_dom[0]
-        else:
-            sex_text = "—"
+            demography_text += f" Sexo dominante: {sex_dom[0]}"
+            if sex_dom[1] is not None:
+                demography_text += f" ({sex_dom[1]:.1f}%)."
         if age_dom[0]:
-            age_text = f"{age_dom[0]} ({age_dom[1]:.1f}%)" if age_dom[1] is not None else age_dom[0]
-        else:
-            age_text = "—"
-        demography_text = f"Pop {population_text}"
-        if sex_text != "—":
-            demography_text += f" | Sexo: {sex_text}"
-        if age_text != "—":
-            demography_text += f" | Idade: {age_text}"
-        municipality = entry.get('municipality') or '—'
-        state = entry.get('state') or '—'
-        distance = entry.get('distance_km')
-        if distance in (None, ""):
-            distance_text = "—"
-        else:
-            try:
-                distance_text = f"{float(distance):.1f}"
-            except (TypeError, ValueError):
-                distance_text = "—"
-        power_text = _format_number(entry.get('power_dbm'), 'dBm')
-        receiver_rows.append([
-            entry.get('label') or 'RX',
-            f"{municipality} / {state}",
-            distance_text,
-            power_text,
-            demography_text,
-        ])
-
-    columns = [
-        ("Receptor", 90),
-        ("Município/UF", 130),
-        ("Distância (km)", 70),
-        ("Potência (dBm)", 70),
-        ("Demografia", 150),
-    ]
-    y = _draw_table(
-        c,
-        y,
-        columns,
-        receiver_rows,
-        width,
-        height,
-        project.slug,
-        "Enlaces e impacto populacional (cont.)",
-        empty_message="Nenhum receptor acima do limiar considerado.",
-        theme_color=header_color,
-    )
-    y -= 6
+            demography_text += f" Faixa etária predominante: {age_dom[0]}"
+            if age_dom[1] is not None:
+                demography_text += f" ({age_dom[1]:.1f}%)."
+        if demography_text:
+            y = _wrap_text(c, demography_text, 50, y - 4, width_chars=95)
+            y -= 4
+        y -= 4
 
     if population_details:
         y = _ensure_space(c, y, 120, width, height, "Enlaces e impacto populacional (cont.)", project.slug, header_color)
@@ -1100,11 +1170,17 @@ def generate_analysis_report(
                 coord_text = f"{float(lat):.4f}, {float(lon):.4f}"
             except (TypeError, ValueError):
                 coord_text = "—"
-            field_value = rx.get('field_strength_dbuv_m') or rx.get('field')
+            field_value = (
+                rx.get('field_strength_dbuv_m')
+                or rx.get('field')
+                or entry.get('field_dbuv_m')
+            )
             power_value = rx.get('power_dbm') or rx.get('power')
             distance_value = rx.get('distance_km') or rx.get('distance')
             altitude_value = rx.get('altitude_m') or location.get('altitude')
             quality_value = rx.get('quality') or rx.get('status') or '—'
+            meets_field_min = entry.get('meets_field_min')
+            field_compliance = "Atende (>=25 dBµV/m)" if meets_field_min else "Abaixo de 25 dBµV/m"
             info_lines = [
                 ('Município/UF', f"{municipality} / {state}"),
                 ('Coordenadas', coord_text),
@@ -1112,6 +1188,7 @@ def generate_analysis_report(
                 ('Potência', _format_number(power_value, 'dBm')),
                 ('Distância', _format_number(distance_value, 'km')),
                 ('Altitude RX', _format_number(altitude_value, 'm')),
+                ('Conformidade 25 dBµV/m', field_compliance),
                 ('Qualidade', quality_value),
             ]
             y = _draw_text_block(c, 50, y, info_lines)
@@ -1126,13 +1203,25 @@ def generate_analysis_report(
                         break
             if analysis_text:
                 c.setFont('Helvetica-Oblique', 9)
-                y = _wrap_text(c, f"Análise IA: {analysis_text}", 50, y, width_chars=95, line_height=12)
+                y = _wrap_text(c, f"Observação automática: {analysis_text}", 50, y, width_chars=95, line_height=12)
+                y -= 4
+            else:
+                c.setFont('Helvetica-Oblique', 9)
+                y = _wrap_text(
+                    c,
+                    "Observação automática indisponível; utilize os níveis de campo acima como referência.",
+                    50,
+                    y,
+                    width_chars=95,
+                    line_height=12,
+                )
                 y -= 4
             profile_blob = _render_receiver_profile_plot(rx)
             if profile_blob:
                 y = _embed_binary_image(c, profile_blob, 50, y - 4, max_width=int(width - 120), max_height=160)
             y -= 8
 
+    y = _ensure_space(c, y, 120, width, height, "Conclusão e alcance estimado", project.slug, header_color)
     c.setFont('Helvetica-Bold', 11)
     c.drawString(40, y, "Conclusão e alcance estimado")
     y -= 16
@@ -1149,7 +1238,8 @@ def generate_analysis_report(
     y = _wrap_text(c, conclusion, 40, y, width_chars=95)
     y -= 10
 
-    ai_conclusion = ai_sections.get("conclusion")
+    y = _ensure_space(c, y, 120, width, height, "Parecer técnico", project.slug, header_color)
+    ai_conclusion = ai_sections.get("conclusion") or "Dados ainda não consolidados para o parecer automatizado."
     if ai_conclusion:
         c.setFont('Helvetica-Bold', 11)
         c.drawString(40, y, "Parecer técnico consolidado")
@@ -1157,9 +1247,17 @@ def generate_analysis_report(
         c.setFont('Helvetica', 10)
         y = _wrap_text(c, ai_conclusion, 40, y, width_chars=95)
         y -= 10
+    positive_note = (
+        f"A equipe técnica mantém perspectiva otimista para {project.name}, "
+        "uma vez que as condições climáticas e os níveis de ERP indicam margem para otimizações contínuas."
+    )
+    c.setFont('Helvetica', 10)
+    y = _wrap_text(c, positive_note, 40, y, width_chars=95)
+    y -= 10
 
     recommendations = ai_sections.get("recommendations") or []
     if recommendations:
+        y = _ensure_space(c, y, 140, width, height, "Recomendações técnicas", project.slug, header_color)
         c.setFont('Helvetica-Bold', 11)
         c.drawString(40, y, "Recomendações técnicas")
         y -= 16

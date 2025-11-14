@@ -2038,6 +2038,67 @@ def calculate_bearing(lat1, lng1, lat2, lng2):
 def fresnel_zone_radius(d1, d2, wavelength):
     return np.sqrt(wavelength * d1 * d2 / (d1 + d2))
 
+
+def _estimate_tile_zoom(bounds_payload):
+    if not bounds_payload:
+        return None, None
+    try:
+        north = float(bounds_payload.get('north'))
+        south = float(bounds_payload.get('south'))
+        east = float(bounds_payload.get('east'))
+        west = float(bounds_payload.get('west'))
+    except (TypeError, ValueError):
+        return None, None
+    lon_span = abs(east - west)
+    lat_span = abs(north - south)
+    span = max(lon_span, lat_span, 1e-6)
+    approx_zoom = math.log2(360.0 / span)
+    approx_zoom = max(0.0, min(18.0, approx_zoom))
+    base_zoom = int(round(approx_zoom))
+    min_zoom = max(0, base_zoom - 2)
+    max_zoom = min(22, base_zoom + 4)
+    if max_zoom < min_zoom:
+        max_zoom = min_zoom
+    return min_zoom, max_zoom
+
+
+def _latlon_to_tile_indices(lat_deg, lon_deg, zoom):
+    lat_rad = math.radians(max(min(lat_deg, 85.05112878), -85.05112878))
+    scale = 1 << zoom
+    x = (lon_deg + 180.0) / 360.0 * scale
+    y = (1.0 - math.log(math.tan(lat_rad) + 1 / math.cos(lat_rad)) / math.pi) / 2.0 * scale
+    return int(math.floor(x)), int(math.floor(y))
+
+
+def _build_tile_signal_stats(signal_level_dict, min_zoom, max_zoom):
+    if not signal_level_dict or min_zoom is None or max_zoom is None:
+        return {}
+    stats = {}
+    for key, value in signal_level_dict.items():
+        try:
+            lat_str, lon_str = key.strip()[1:-1].split(',')
+            lat = float(lat_str)
+            lon = float(lon_str)
+            field_val = float(value)
+        except (ValueError, IndexError, AttributeError, TypeError):
+            continue
+        for zoom in range(int(min_zoom), int(max_zoom) + 1):
+            x_idx, y_idx = _latlon_to_tile_indices(lat, lon, zoom)
+            bucket = stats.setdefault(str(zoom), {})
+            tile_key = f"{x_idx}/{y_idx}"
+            entry = bucket.setdefault(tile_key, {"sum": 0.0, "count": 0})
+            entry["sum"] += field_val
+            entry["count"] += 1
+    summary = {}
+    for zoom_key, tiles in stats.items():
+        cleaned = {}
+        for tile_key, payload in tiles.items():
+            if payload["count"]:
+                cleaned[tile_key] = round(payload["sum"] / payload["count"], 2)
+        if cleaned:
+            summary[zoom_key] = cleaned
+    return summary
+
 # -------- Perfil (TX → RX) COM CORREÇÃO DA CURVATURA --------
 
 @bp.route('/gerar_img_perfil', methods=['POST'])
@@ -2870,7 +2931,6 @@ def _lookup_municipality_details(lat, lon, include_ibge=False):
                 'longitude': lon,
                 'count': 1,
                 'language': 'pt',
-                'format': 'json',
             },
             {},
         ),
@@ -2890,6 +2950,9 @@ def _lookup_municipality_details(lat, lon, include_ibge=False):
     for provider, url, params, extra in providers:
         try:
             resp = requests.get(url, params=params, timeout=15, **extra)
+            if resp.status_code == 404 and provider == 'open-meteo':
+                current_app.logger.info('geocoding.open_meteo.empty', extra={'lat': lat, 'lon': lon})
+                continue
             resp.raise_for_status()
             data = resp.json()
             detail = None
@@ -3379,11 +3442,11 @@ def _render_field_strength_image(lons_deg, lats_deg, field_levels,
         if pattern_db.ndim == 0:
             pattern_db = np.array([pattern_db], dtype=float)
         pattern_db = np.nan_to_num(pattern_db, nan=-40.0)
-        pattern_db = np.clip(pattern_db, -40.0, 0.0)
-        min_db = float(np.nanmin(pattern_db))
-        max_db = float(np.nanmax(pattern_db))
-        shift = abs(min_db)
-        radius = pattern_db + shift
+        pattern_linear = np.clip(10.0 ** (pattern_db / 20.0), 1e-6, None)
+        max_linear = float(np.nanmax(pattern_linear)) if np.isfinite(pattern_linear).any() else 1.0
+        if max_linear <= 0:
+            max_linear = 1.0
+        pattern_linear = np.clip(pattern_linear / max_linear, 0.0, 1.0)
         polar_dimension = min(fig.get_size_inches()) * 0.35
         inset_left = (1.0 - polar_dimension / fig.get_size_inches()[0]) * 0.5
         inset_bottom = (1.0 - polar_dimension / fig.get_size_inches()[1]) * 0.5
@@ -3393,17 +3456,18 @@ def _render_field_strength_image(lons_deg, lats_deg, field_levels,
              polar_dimension / fig.get_size_inches()[1]],
             polar=True,
         )
+        azimutes = np.linspace(0, 2 * np.pi, len(pattern_linear), endpoint=False)
         ax_inset.set_theta_zero_location('N')
         ax_inset.set_theta_direction(-1)
-        azimutes = np.linspace(0, 2 * np.pi, len(radius), endpoint=False)
-        ax_inset.plot(azimutes, radius, color='#f50057', linewidth=2)
-        ax_inset.fill_between(azimutes, 0, radius, color='#f50057', alpha=0.08)
+        ax_inset.plot(azimutes, pattern_linear, color='#0d47a1', linewidth=2)
+        ax_inset.fill_between(azimutes, 0, pattern_linear, color='#0d47a1', alpha=0.12)
         ax_inset.set_xticks([])
-        ticks_db = np.linspace(min_db, 0.0, 3)
-        ax_inset.set_yticks([t + shift for t in ticks_db])
-        ax_inset.set_yticklabels([f"{t:.0f} dB" for t in ticks_db], fontsize=7)
+        ax_inset.set_yticks([0.25, 0.5, 0.75, 1.0])
+        ax_inset.set_yticklabels(['0.25', '0.50', '0.75', '1.00'], fontsize=7)
+        ax_inset.set_ylim(0.0, 1.05)
         ax_inset.spines['polar'].set_visible(False)
-        ax_inset.set_title('Diagrama H (dB)', fontsize=8)
+        ax_inset.grid(True, linestyle='--', linewidth=0.6, alpha=0.4)
+        ax_inset.set_title('Diagrama H (E/Emax)', fontsize=8)
 
     for spine in ax.spines.values():
         spine.set_visible(False)
@@ -3754,6 +3818,9 @@ def _compute_rt3d_only_map(tx, data, include_arrays=False, label=None, rt3d_scen
             if np.isfinite(Prx_dbm[i, j]):
                 signal_level_dict_dbm[f"({lat_val}, {lon_val})"] = float(Prx_dbm[i, j])
 
+    tile_min_zoom, tile_max_zoom = _estimate_tile_zoom(bounds)
+    tile_stats_payload = _build_tile_signal_stats(signal_level_dict, tile_min_zoom, tile_max_zoom)
+
     payload = {
         "images": images_payload,
         "bounds": bounds,
@@ -3794,6 +3861,10 @@ def _compute_rt3d_only_map(tx, data, include_arrays=False, label=None, rt3d_scen
             "minimum_clearance_m": minimum_clearance_m,
         },
     }
+    if tile_min_zoom is not None and tile_max_zoom is not None:
+        payload["tile_zoom"] = {"min": int(tile_min_zoom), "max": int(tile_max_zoom)}
+    if tile_stats_payload:
+        payload["tile_stats"] = tile_stats_payload
     if penalty_meta.get('rays'):
         payload['rt3dRays'] = penalty_meta['rays']
 
@@ -3960,37 +4031,34 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
     bounds_payload = coverage_payload.get('bounds')
     if bounds_payload:
         try:
-            north = float(bounds_payload.get('north'))
-            south = float(bounds_payload.get('south'))
-            east = float(bounds_payload.get('east'))
-            west = float(bounds_payload.get('west'))
-            lon_span = abs(east - west)
-            lat_span = abs(north - south)
-            span = max(lon_span, lat_span, 1e-6)
-            approx_zoom = math.log2(360.0 / span)
-            approx_zoom = max(0.0, min(18.0, approx_zoom))
-            base_zoom = int(round(approx_zoom))
-            min_zoom = max(0, base_zoom - 2)
-            max_zoom = min(22, base_zoom + 4)
-            if max_zoom < min_zoom:
-                max_zoom = min_zoom
-
-            base_tile_url = url_for(
-                'projects.coverage_tile',
-                slug=project.slug,
-                asset_id=str(heatmap_asset.id),
-                z=0,
-                x=0,
-                y=0,
-            )
-            template_url = base_tile_url.replace('/0/0/0.png', '/{z}/{x}/{y}.png')
-            tile_metadata = {
-                "asset_id": str(heatmap_asset.id),
-                "url_template": template_url,
-                "min_zoom": min_zoom,
-                "max_zoom": max_zoom,
-                "bounds": _clean_json(bounds_payload),
-            }
+            min_zoom = None
+            max_zoom = None
+            tile_zoom_payload = coverage_payload.get('tile_zoom') or {}
+            if tile_zoom_payload:
+                min_zoom = tile_zoom_payload.get('min')
+                max_zoom = tile_zoom_payload.get('max')
+            if min_zoom is None or max_zoom is None:
+                min_zoom, max_zoom = _estimate_tile_zoom(bounds_payload)
+            if min_zoom is not None and max_zoom is not None:
+                base_tile_url = url_for(
+                    'projects.coverage_tile',
+                    slug=project.slug,
+                    asset_id=str(heatmap_asset.id),
+                    z=0,
+                    x=0,
+                    y=0,
+                )
+                template_url = base_tile_url.replace('/0/0/0.png', '/{z}/{x}/{y}.png')
+                tile_metadata = {
+                    "asset_id": str(heatmap_asset.id),
+                    "url_template": template_url,
+                    "min_zoom": int(min_zoom),
+                    "max_zoom": int(max_zoom),
+                    "bounds": _clean_json(bounds_payload),
+                }
+                tile_stats_payload = coverage_payload.get('tile_stats')
+                if tile_stats_payload:
+                    tile_metadata["stats"] = tile_stats_payload
         except Exception as exc:
             current_app.logger.warning(
                 'coverage.tiles.metadata_failed',

@@ -30,6 +30,8 @@ const state = {
     directionLine: null,
     coverageOverlay: null,
     tileOverlayLayer: null,
+    tileLabelLayer: null,
+    tileOverlayLayer: null,
     radiusCircle: null,
     coverageData: null,
     overlayOpacity: OVERLAY_DEFAULT_OPACITY,
@@ -50,6 +52,8 @@ const state = {
 };
 
 let profileLoading = false;
+
+const BLANK_TILE_DATA_URL = 'data:image/gif;base64,R0lGODlhAQABAPAAAAAAAAAAACH5BAAAAAAALAAAAAABAAEAAAICRAEAOw==';
 
 function formatNumber(value, suffix = '') {
     if (value === undefined || value === null || Number.isNaN(value)) {
@@ -97,6 +101,32 @@ function parseNullableNumber(raw) {
     }
     const asNumber = Number(text);
     return Number.isFinite(asNumber) ? asNumber : null;
+}
+
+function getTileStatValue(stats, zoom, x, y) {
+    if (!stats) {
+        return null;
+    }
+    const bucket = stats[String(zoom)] || stats[zoom];
+    if (!bucket) {
+        return null;
+    }
+    const scale = 1 << zoom;
+    const normalizedX = ((x % scale) + scale) % scale;
+    return bucket[`${normalizedX}/${y}`] ?? null;
+}
+
+function createTileLabelUrl(value) {
+    if (value === null || value === undefined) {
+        return BLANK_TILE_DATA_URL;
+    }
+    const text = `${value.toFixed(1)} dBµV/m`;
+    const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256">
+        <rect width="256" height="256" fill="rgba(255,255,255,0)"/>
+        <rect x="6" y="6" rx="6" ry="6" width="140" height="32" fill="rgba(255,255,255,0.65)"/>
+        <text x="16" y="30" font-family="Inter, Arial, sans-serif" font-size="14" fill="#0f172a">${text}</text>
+    </svg>`;
+    return `data:image/svg+xml;charset=UTF-8,${encodeURIComponent(svg)}`;
 }
 
 function formatLegendValue(value, suffix = '') {
@@ -992,21 +1022,23 @@ function restoreCoverageFromProject(data) {
 }
 
 function removeTileOverlay() {
-    if (!state.map || !state.tileOverlayLayer) {
+    if (!state.map) {
         return;
     }
     const overlays = state.map.overlayMapTypes;
     if (!overlays) {
         state.tileOverlayLayer = null;
+        state.tileLabelLayer = null;
         return;
     }
     for (let i = overlays.getLength() - 1; i >= 0; i -= 1) {
-        if (overlays.getAt(i) === state.tileOverlayLayer) {
+        const layer = overlays.getAt(i);
+        if (layer === state.tileOverlayLayer || layer === state.tileLabelLayer) {
             overlays.removeAt(i);
-            break;
         }
     }
     state.tileOverlayLayer = null;
+    state.tileLabelLayer = null;
 }
 
 function applyTileOverlay(tileConfig) {
@@ -1044,6 +1076,24 @@ function applyTileOverlay(tileConfig) {
 
     state.map.overlayMapTypes.push(layer);
     state.tileOverlayLayer = layer;
+
+    const statsPayload = tileConfig.stats || tileConfig.tile_stats;
+    if (statsPayload && Object.keys(statsPayload).length) {
+        const statsLayer = new google.maps.ImageMapType({
+            getTileUrl: (coord, zoom) => {
+                const value = getTileStatValue(statsPayload, zoom, coord.x, coord.y);
+                return createTileLabelUrl(value);
+            },
+            tileSize: new google.maps.Size(256, 256),
+            opacity: 1,
+            minZoom,
+            maxZoom,
+        });
+        state.map.overlayMapTypes.push(statsLayer);
+        state.tileLabelLayer = statsLayer;
+    } else {
+        state.tileLabelLayer = null;
+    }
 }
 
 function clearCoverageOverlay() {
@@ -1941,6 +1991,19 @@ function confirmPersistAndGenerate(options = {}) {
         receivers: serializeReceivers(),
     };
 
+    const directionControl = document.getElementById('directionControl');
+    if (directionControl && directionControl.value !== '') {
+        const directionValue = normalizeAzimuth(Number(directionControl.value));
+        payload.direction = directionValue;
+    }
+    const tiltControl = document.getElementById('tiltControl');
+    if (tiltControl && tiltControl.value !== '') {
+        const tiltValue = Number(tiltControl.value);
+        if (Number.isFinite(tiltValue)) {
+            payload.tilt = tiltValue;
+        }
+    }
+
     return fetch('/calculate-coverage', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -2062,6 +2125,12 @@ function confirmPersistAndGenerate(options = {}) {
                     state.txData.txElevation = data.txElevation ?? data.tx_site_elevation;
                 }
                 state.txData.location_status = data.location_status || state.txData.location_status;
+                if (payload.direction !== undefined && payload.direction !== null) {
+                    state.txData.antennaDirection = payload.direction;
+                }
+                if (payload.tilt !== undefined && payload.tilt !== null) {
+                    state.txData.antennaTilt = payload.tilt;
+                }
                 updateTxSummary(state.txData);
             }
 

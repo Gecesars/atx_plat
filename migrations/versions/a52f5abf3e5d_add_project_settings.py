@@ -18,11 +18,19 @@ branch_labels = None
 depends_on = None
 
 
+def _has_column(table_name: str, column_name: str) -> bool:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    return column_name in {col["name"] for col in inspector.get_columns(table_name)}
+
+
 def upgrade() -> None:
-    with op.batch_alter_table("projects") as batch_op:
-        batch_op.add_column(sa.Column("settings", sa.JSON(), nullable=True))
+    if not _has_column("projects", "settings"):
+        with op.batch_alter_table("projects") as batch_op:
+            batch_op.add_column(sa.Column("settings", sa.JSON(), nullable=True))
 
 
 def downgrade() -> None:
-    with op.batch_alter_table("projects") as batch_op:
-        batch_op.drop_column("settings")
+    if _has_column("projects", "settings"):
+        with op.batch_alter_table("projects") as batch_op:
+            batch_op.drop_column("settings")

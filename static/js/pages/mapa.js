@@ -49,6 +49,9 @@ const state = {
     isRt3dRaysVisible: true,
     rt3dRays: null,
     rt3dSettings: null,
+    rxContextMenu: null,
+    rxContextMenuEntry: null,
+    rxMoveCandidate: null,
 };
 
 let profileLoading = false;
@@ -838,6 +841,11 @@ function serializeReceivers() {
                 profile_asset_path: entry.profileAssetPath || null,
                 profile_asset_url: entry.profileAssetUrl || null,
             };
+            if (summary.populationValue !== undefined && summary.populationValue !== null) {
+                payload.population = summary.populationValue;
+                payload.population_text = summary.population || null;
+                payload.population_year = summary.populationYear ?? null;
+            }
             if (entry.receiverRecord?.ibge) {
                 payload.ibge = entry.receiverRecord.ibge;
             }
@@ -888,11 +896,31 @@ function buildSummaryFromReceiver(receiver) {
     if (receiver.ibge) {
         summary.ibge = receiver.ibge;
     }
+    const populationCandidate = parseNullableNumber(
+        receiver.population
+        ?? receiver.population_value
+        ?? receiver.demographics?.total
+        ?? receiver.summary?.populationValue
+    );
+    if (Number.isFinite(populationCandidate)) {
+        summary.populationValue = Number(populationCandidate);
+        try {
+            summary.population = Number(populationCandidate).toLocaleString('pt-BR');
+        } catch (error) {
+            summary.population = String(populationCandidate);
+        }
+    } else if (receiver.population_text) {
+        summary.population = receiver.population_text;
+    }
+    summary.populationYear = receiver.population_year
+        || receiver.demographics?.period
+        || receiver.summary?.populationYear
+        || null;
     return summary;
 }
 
 function restoreReceivers(receivers) {
-    clearReceivers();
+    clearReceivers({ persist: false });
     if (!Array.isArray(receivers) || !receivers.length || !state.map) {
         return;
     }
@@ -932,6 +960,106 @@ function showToast(message, isError = false) {
     setTimeout(() => {
         card.hidden = true;
     }, 3600);
+}
+
+function initRxContextMenu() {
+    const menu = document.getElementById('rxContextMenu');
+    if (!menu) return;
+    state.rxContextMenu = menu;
+    menu.addEventListener('click', (event) => {
+        event.stopPropagation();
+    });
+    const actionButtons = menu.querySelectorAll('button[data-action]');
+    actionButtons.forEach((button) => {
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            const action = button.dataset.action;
+            const entry = state.rxContextMenuEntry;
+            hideRxContextMenu();
+            if (!entry) return;
+            if (action === 'move') {
+                startReceiverRelocation(entry);
+            } else if (action === 'profile') {
+                requestProfileGeneration(entry, { force: false, openModal: true });
+            } else if (action === 'delete') {
+                const index = state.rxEntries.indexOf(entry);
+                if (index >= 0) {
+                    removeRx(index);
+                }
+            }
+        });
+    });
+    document.addEventListener('click', (event) => {
+        if (!state.rxContextMenu || state.rxContextMenu.hidden) return;
+        if (state.rxContextMenu.contains(event.target)) return;
+        hideRxContextMenu();
+    });
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            hideRxContextMenu();
+            cancelReceiverRelocation();
+        }
+    });
+}
+
+function showRxContextMenu(entry, mapEvent) {
+    const menu = state.rxContextMenu;
+    if (!menu) return;
+    state.rxContextMenuEntry = entry;
+    const container = document.getElementById('coverageMapContainer');
+    const rect = container ? container.getBoundingClientRect() : { left: 0, top: 0 };
+    let clientX = 0;
+    let clientY = 0;
+    if (mapEvent && mapEvent.domEvent) {
+        clientX = mapEvent.domEvent.clientX;
+        clientY = mapEvent.domEvent.clientY;
+    } else if (mapEvent && typeof mapEvent.clientX === 'number') {
+        clientX = mapEvent.clientX;
+        clientY = mapEvent.clientY;
+    }
+    menu.style.left = `${clientX - rect.left}px`;
+    menu.style.top = `${clientY - rect.top}px`;
+    menu.hidden = false;
+}
+
+function hideRxContextMenu() {
+    if (state.rxContextMenu) {
+        state.rxContextMenu.hidden = true;
+    }
+    state.rxContextMenuEntry = null;
+}
+
+function startReceiverRelocation(entry) {
+    state.rxMoveCandidate = entry;
+    if (state.map) {
+        state.map.setOptions({ draggableCursor: 'crosshair' });
+    }
+    showToast(`Clique no mapa para reposicionar ${entry.label}.`);
+}
+
+function cancelReceiverRelocation() {
+    state.rxMoveCandidate = null;
+    if (state.map) {
+        state.map.setOptions({ draggableCursor: null });
+    }
+}
+
+function completeReceiverRelocation(entry, latLng) {
+    if (!entry || !latLng) return;
+    entry.marker.setPosition(latLng);
+    cancelReceiverRelocation();
+    entry.summary = null;
+    computeReceiverSummary(latLng).then((summary) => {
+        entry.summary = summary;
+        if (state.selectedRxIndex === state.rxEntries.indexOf(entry)) {
+            updateLinkSummary(summary);
+        }
+        renderRxList();
+    });
+    if (state.coverageData) {
+        state.coverageData.receivers = serializeReceivers();
+    }
+    requestProfileGeneration(entry, { force: true, silent: true });
 }
 
 function setProfileLoading(isLoading) {
@@ -1037,17 +1165,42 @@ function removeTileOverlay() {
     state.tileLabelLayer = null;
 }
 
-function applyTileOverlay(tileConfig) {
-    if (!state.map || !tileConfig) {
-        return;
-    }
-    const template = tileConfig.url_template || tileConfig.urlTemplate;
-    if (!template) {
-        return;
-    }
+function _isValidTileConfig(tileConfig) {
+    if (!tileConfig) return false;
+    const template = tileConfig.url_template || tileConfig.urlTemplate || '';
+    const assetId = tileConfig.asset_id || tileConfig.assetId;
+    if (!assetId || assetId === 'None') return false;
+    if (!template || template.includes('/None/')) return false;
+    return true;
+}
 
-    const minZoom = Number(tileConfig.min_zoom ?? tileConfig.minZoom ?? 3);
-    const maxZoom = Number(tileConfig.max_zoom ?? tileConfig.maxZoom ?? 21);
+function _sanitizeTileConfig(tileConfig) {
+    return _isValidTileConfig(tileConfig) ? {
+        asset_id: tileConfig.asset_id || tileConfig.assetId,
+        url_template: tileConfig.url_template || tileConfig.urlTemplate,
+        min_zoom: tileConfig.min_zoom ?? tileConfig.minZoom,
+        max_zoom: tileConfig.max_zoom ?? tileConfig.maxZoom,
+        stats: tileConfig.stats || tileConfig.tile_stats || null,
+        bounds: tileConfig.bounds || null,
+    } : null;
+}
+
+function applyTileOverlay(tileConfig) {
+    if (!state.map) {
+        return false;
+    }
+    const sanitizedTileConfig = _sanitizeTileConfig(tileConfig);
+    if (!sanitizedTileConfig) {
+        removeTileOverlay();
+        if (state.coverageData) {
+            state.coverageData.tiles = null;
+        }
+        return false;
+    }
+    const template = sanitizedTileConfig.url_template;
+
+    const minZoom = Number(sanitizedTileConfig.min_zoom ?? 3);
+    const maxZoom = Number(sanitizedTileConfig.max_zoom ?? 21);
 
     removeTileOverlay();
 
@@ -1077,19 +1230,23 @@ function applyTileOverlay(tileConfig) {
     if (statsPayload && Object.keys(statsPayload).length) {
         const statsLayer = new google.maps.ImageMapType({
             getTileUrl: (coord, zoom) => {
-                const value = getTileStatValue(statsPayload, zoom, coord.x, coord.y);
-                return createTileLabelUrl(value);
-            },
-            tileSize: new google.maps.Size(256, 256),
-            opacity: 1,
-            minZoom,
-            maxZoom,
-        });
-        state.map.overlayMapTypes.push(statsLayer);
-        state.tileLabelLayer = statsLayer;
+            const value = getTileStatValue(sanitizedTileConfig.stats, zoom, coord.x, coord.y);
+            return createTileLabelUrl(value);
+        },
+        tileSize: new google.maps.Size(256, 256),
+        opacity: 1,
+        minZoom,
+        maxZoom,
+    });
+    state.map.overlayMapTypes.push(statsLayer);
+    state.tileLabelLayer = statsLayer;
     } else {
         state.tileLabelLayer = null;
     }
+    if (state.coverageData) {
+        state.coverageData.tiles = sanitizedTileConfig;
+    }
+    return true;
 }
 
 function clearCoverageOverlay() {
@@ -1113,7 +1270,7 @@ function applyCoverageOverlay(response) {
     let colorbarImage = response.colorbar || null;
 
     const tileConfig = response.tiles || response.tile_layer || null;
-    const hasTileLayer = Boolean(tileConfig && (tileConfig.url_template || tileConfig.urlTemplate));
+    const overlayFromTiles = applyTileOverlay(tileConfig);
 
     if (response.images) {
         const availableUnits = Object.keys(response.images);
@@ -1144,12 +1301,7 @@ function applyCoverageOverlay(response) {
         }
     }
 
-    if (hasTileLayer) {
-        applyTileOverlay(tileConfig);
-        if (state.coverageData) {
-            state.coverageData.tiles = tileConfig;
-        }
-    } else {
+    if (!overlayFromTiles) {
         const bounds = response.bounds;
         if (!bounds) {
             console.warn('Resposta sem limites de cobertura.', response);
@@ -1300,7 +1452,7 @@ async function loadCoverageOverlay(lastCoverage) {
         rt3dDiagnostics: summary?.rt3d_diagnostics || lastCoverage.rt3d_diagnostics || null,
         rt3dRays: summary?.rt3d_rays || lastCoverage.rt3d_rays || null,
         rt3dSettings: summary?.rt3d_settings || lastCoverage.rt3d_settings || null,
-        tiles: summary?.tiles || lastCoverage.tiles || null,
+        tiles: _sanitizeTileConfig(summary?.tiles) ?? _sanitizeTileConfig(lastCoverage.tiles) ?? null,
     };
 
     const centerLat = parseNullableNumber(
@@ -1339,7 +1491,7 @@ async function loadCoverageOverlay(lastCoverage) {
     }
     state.coverageData.signal_level_dict = coveragePayload.signal_level_dict;
     state.coverageData.signal_level_dict_dbm = coveragePayload.signal_level_dict_dbm;
-    state.coverageData.tiles = coveragePayload.tiles || null;
+    state.coverageData.tiles = _sanitizeTileConfig(coveragePayload.tiles) || null;
     state.coverageData.project_slug = slug;
     state.coverageData.rt3dScene = coveragePayload.rt3dScene || summary?.rt3d_scene || lastCoverage.rt3d_scene || state.coverageData.rt3dScene || null;
     state.coverageData.rt3dDiagnostics = coveragePayload.rt3dDiagnostics || summary?.rt3d_diagnostics || lastCoverage.rt3d_diagnostics || state.coverageData.rt3dDiagnostics || null;
@@ -1445,6 +1597,10 @@ function updateLinkSummary(summary) {
     document.getElementById('linkBearing').textContent = summary.bearing || '-';
     document.getElementById('linkField').textContent = summary.field || '-';
     document.getElementById('linkElevation').textContent = summary.elevation || '-';
+    const populationLabel = document.getElementById('linkPopulation');
+    if (populationLabel) {
+        populationLabel.textContent = summary.population || '-';
+    }
 }
 
 function highlightRxEntry(index) {
@@ -1479,21 +1635,38 @@ function selectRx(index) {
     document.getElementById('btnGenerateProfile').disabled = false;
 }
 
-function removeRx(index) {
+function deleteReceiverBookmark(receiverId) {
+    const projectSlug = getActiveProjectSlug();
+    if (!projectSlug || !receiverId) {
+        return Promise.resolve();
+    }
+    return fetch(`/projects/${encodeURIComponent(projectSlug)}/receivers/${encodeURIComponent(receiverId)}`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+    }).catch(() => {});
+}
+
+function clearProjectReceiversOnServer() {
+    const projectSlug = getActiveProjectSlug();
+    if (!projectSlug) {
+        return Promise.resolve();
+    }
+    return fetch(`/projects/${encodeURIComponent(projectSlug)}/receivers`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+    }).catch(() => {});
+}
+
+function removeRx(index, options = {}) {
+    const persist = options.persist !== false;
     const [entry] = state.rxEntries.splice(index, 1);
     if (entry) {
         entry.marker.setMap(null);
-        if (entry.id) {
+        if (entry.id && persist) {
             state.savedReceiverBookmarks = state.savedReceiverBookmarks.filter(
                 (bookmark) => bookmark.id !== entry.id,
             );
-            const projectSlug = getActiveProjectSlug();
-            if (projectSlug) {
-                fetch(`/projects/${encodeURIComponent(projectSlug)}/receivers/${encodeURIComponent(entry.id)}`, {
-                    method: 'DELETE',
-                    headers: { 'Content-Type': 'application/json' },
-                }).catch(() => {});
-            }
+            deleteReceiverBookmark(entry.id);
         }
     }
     if (state.linkLine) {
@@ -1511,9 +1684,12 @@ function removeRx(index) {
     }
 }
 
-function clearReceivers() {
+function clearReceivers(options = {}) {
+    const persist = options.persist !== false;
+    hideRxContextMenu();
+    cancelReceiverRelocation();
     while (state.rxEntries.length) {
-        removeRx(0);
+        removeRx(0, { persist: false });
     }
     state.selectedRxIndex = null;
 
@@ -1525,11 +1701,23 @@ function clearReceivers() {
     updateLinkSummary({});
     renderRxList();
     document.getElementById('btnGenerateProfile').disabled = true;
-    if (state.coverageData) {
-        state.coverageData.receivers = [];
-    }
     if (state.rxInfoWindow) {
         state.rxInfoWindow.close();
+    }
+    if (persist) {
+        state.savedReceiverBookmarks = [];
+        if (state.coverageData) {
+            state.coverageData.receivers = [];
+        }
+        clearProjectReceiversOnServer()
+            .then(() => {
+                clearCoverageOverlay();
+                state.coverageData = null;
+            })
+            .catch(() => {
+                clearCoverageOverlay();
+                state.coverageData = null;
+            });
     }
 }
 
@@ -1598,6 +1786,7 @@ function renderRxList() {
             <span><strong>Campo</strong>${summary.field || '-'}</span>
             <span><strong>Altitude</strong>${summary.elevation || '-'}</span>
             <span><strong>Azimute</strong>${summary.bearing || '-'}</span>
+            <span><strong>População</strong>${summary.population || '-'}</span>
         `;
 
         const actions = document.createElement('div');
@@ -1609,6 +1798,7 @@ function renderRxList() {
         focusBtn.className = 'btn btn-sm btn-outline-primary';
         focusBtn.onclick = (event) => {
             event.stopPropagation();
+            hideRxContextMenu();
             state.map.panTo(entry.marker.getPosition());
             state.map.setZoom(Math.max(state.map.getZoom(), 11));
             selectRx(idx);
@@ -1621,6 +1811,7 @@ function renderRxList() {
         profileBtn.disabled = entry.isProfileLoading;
         profileBtn.onclick = (event) => {
             event.stopPropagation();
+            hideRxContextMenu();
             if (entry.profileThumbnail || entry.profileAssetUrl) {
                 showProfileModal(entry);
             } else {
@@ -1634,6 +1825,7 @@ function renderRxList() {
         removeBtn.className = 'btn btn-sm btn-link text-danger';
         removeBtn.onclick = (event) => {
             event.stopPropagation();
+            hideRxContextMenu();
             removeRx(idx);
         };
 
@@ -1781,11 +1973,16 @@ function createRxMarker(position, options = {}) {
         receiverRecord: options.receiverRecord || null,
     };
 
-    marker.addListener('click', () => {
+    marker.addListener('click', (event) => {
         const index = state.rxEntries.indexOf(entry);
         if (index >= 0) {
             selectRx(index);
         }
+        if (event && event.domEvent) {
+            event.domEvent.preventDefault();
+            event.domEvent.stopPropagation();
+        }
+        showRxContextMenu(entry, event);
     });
 
     state.rxEntries.push(entry);
@@ -1829,7 +2026,16 @@ function createRxMarker(position, options = {}) {
 }
 
 function handleMapClick(event) {
+    hideRxContextMenu();
+    if (state.rxMoveCandidate) {
+        completeReceiverRelocation(state.rxMoveCandidate, event.latLng);
+        return;
+    }
     if (!state.txCoords) return;
+    const confirmed = window.confirm('Deseja adicionar um receptor neste ponto?');
+    if (!confirmed) {
+        return;
+    }
     createRxMarker(event.latLng);
 }
 
@@ -2048,7 +2254,11 @@ function confirmPersistAndGenerate(options = {}) {
             coverageState.scale = data.scale || coverageState.scale;
             coverageState.bounds = data.bounds || coverageState.bounds;
             coverageState.location_status = data.location_status || coverageState.location_status;
-            coverageState.tiles = data.tiles || coverageState.tiles || data.lastCoverage?.tiles || null;
+            coverageState.tiles =
+                _sanitizeTileConfig(data.tiles)
+                || _sanitizeTileConfig(coverageState.tiles)
+                || _sanitizeTileConfig(data.lastCoverage?.tiles)
+                || null;
             coverageState.rt3dScene = data.rt3dScene
                 || coverageState.rt3dScene
                 || data.lastCoverage?.rt3d_scene
@@ -2370,6 +2580,13 @@ function initControls() {
     document.getElementById('btnGenerateProfile').addEventListener('click', showSelectedProfile);
     document.getElementById('btnClearRx').addEventListener('click', clearReceivers);
 
+    const refreshBtn = document.getElementById('refreshMapData');
+    if (refreshBtn) {
+        refreshBtn.addEventListener('click', () => {
+            synchronizeProjectData(refreshBtn);
+        });
+    }
+
     const overlayInput = document.getElementById('overlayOpacity');
     const overlayLabel = document.getElementById('overlayOpacityValue');
 
@@ -2469,6 +2686,118 @@ function initControls() {
             window.open(url, '_blank', 'noopener');
         });
     }
+
+    initRxContextMenu();
+}
+
+async function synchronizeProjectData(buttonEl) {
+    if (!state.map) {
+        window.location.reload();
+        return;
+    }
+    hideRxContextMenu();
+    cancelReceiverRelocation();
+    const slug = getActiveProjectSlug() || window.coverageProjectSlug;
+    if (!slug) {
+        showToast('Nenhum projeto selecionado.', true);
+        return;
+    }
+    if (buttonEl) {
+        buttonEl.disabled = true;
+        buttonEl.classList.add('loading');
+    }
+    try {
+        const params = new URLSearchParams({ project: slug, _: Date.now().toString() });
+        const response = await fetch(`/carregar-dados?${params.toString()}`);
+        if (!response.ok) {
+            throw new Error('Falha ao carregar dados do projeto.');
+        }
+        const data = await response.json();
+        const projectSettings = data.projectSettings || {};
+        const lastCoverage = projectSettings.lastCoverage || {};
+        const container = document.getElementById('coverageMapContainer');
+        const { lat: finalLat, lng: finalLng } = resolveProjectCoordinates(
+            projectSettings,
+            lastCoverage,
+            data,
+            container,
+        );
+        const txLatLng = new google.maps.LatLng(finalLat, finalLng);
+        setTxCoords(txLatLng, { pan: false });
+
+        state.txData = { ...(state.txData || {}), ...data };
+        state.txData.coverageEngine = data.coverageEngine || data.coverage_engine || state.txData.coverageEngine;
+        state.txData.txElevation = data.txElevation ?? data.tx_site_elevation ?? state.txData.txElevation;
+        state.txData.txLocationName = data.txLocationName || data.tx_location_name || data.municipality || state.txData.txLocationName;
+        updateTxSummary(state.txData);
+        window.coverageProjectSlug = slug;
+
+        const receiverBookmarks = Array.isArray(data.receiverBookmarks)
+            ? data.receiverBookmarks
+            : (Array.isArray(projectSettings.receiverBookmarks) ? projectSettings.receiverBookmarks : []);
+        state.savedReceiverBookmarks = receiverBookmarks;
+
+        state.coverageData = lastCoverage.project_slug || lastCoverage.asset_id
+            ? { ...lastCoverage, project_slug: lastCoverage.project_slug || slug }
+            : null;
+        if (state.coverageData) {
+            state.coverageData.tiles = _sanitizeTileConfig(state.coverageData.tiles) || null;
+        }
+
+        clearCoverageOverlay();
+        clearReceivers({ persist: false });
+
+        if (state.coverageData && state.coverageData.asset_id) {
+            try {
+                await loadCoverageOverlay(state.coverageData);
+            } catch (error) {
+                console.warn('Falha ao restaurar cobertura após sincronização.', error);
+                if (receiverBookmarks.length) {
+                    restoreReceivers(receiverBookmarks);
+                } else {
+                    renderRxList();
+                }
+            }
+        } else if (state.coverageData && state.coverageData.images) {
+            applyCoverageOverlay(state.coverageData);
+            const merged = mergeReceiverSnapshots(receiverBookmarks, state.coverageData.receivers || []);
+            state.coverageData.receivers = merged;
+            restoreReceivers(merged);
+        } else if (receiverBookmarks.length) {
+            restoreReceivers(receiverBookmarks);
+            if (state.coverageData) {
+                state.coverageData.receivers = serializeReceivers();
+            }
+        } else {
+            renderRxList();
+        }
+
+        showToast('Dados sincronizados com sucesso.');
+    } catch (error) {
+        console.error('Erro ao sincronizar os dados do projeto', error);
+        showToast('Não foi possível sincronizar os dados do projeto.', true);
+    } finally {
+        if (buttonEl) {
+            buttonEl.disabled = false;
+            buttonEl.classList.remove('loading');
+        }
+    }
+}
+
+function resolveProjectCoordinates(projectSettings = {}, lastCoverage = {}, payload = {}, container = null) {
+    const coverageCenter = lastCoverage.center || lastCoverage.tx_location || null;
+    const storedLat = parseNullableNumber(projectSettings.latitude);
+    const storedLng = parseNullableNumber(projectSettings.longitude);
+    const coverageLat = parseNullableNumber(coverageCenter?.lat ?? coverageCenter?.latitude);
+    const coverageLng = parseNullableNumber(coverageCenter?.lng ?? coverageCenter?.longitude);
+    const dataLat = parseNullableNumber(payload.latitude);
+    const dataLng = parseNullableNumber(payload.longitude);
+    const containerLat = container ? parseNullableNumber(container.dataset.startLat) : null;
+    const containerLng = container ? parseNullableNumber(container.dataset.startLng) : null;
+    return {
+        lat: storedLat ?? coverageLat ?? dataLat ?? containerLat ?? 0,
+        lng: storedLng ?? coverageLng ?? dataLng ?? containerLng ?? 0,
+    };
 }
 
 function initCoverageMap() {
@@ -2499,20 +2828,13 @@ function initCoverageMap() {
                 window.coverageProjectSlug = slugCandidate;
             }
 
-            const storedLat = parseNullableNumber(projectSettings.latitude);
-            const storedLng = parseNullableNumber(projectSettings.longitude);
-
             const coverageCenter = lastCoverage.center || lastCoverage.tx_location || null;
-            const coverageLat = parseNullableNumber(coverageCenter?.lat ?? coverageCenter?.latitude);
-            const coverageLng = parseNullableNumber(coverageCenter?.lng ?? coverageCenter?.longitude);
-
-            const dataLat = parseNullableNumber(data.latitude);
-            const dataLng = parseNullableNumber(data.longitude);
-            const containerLat = container ? parseNullableNumber(container.dataset.startLat) : null;
-            const containerLng = container ? parseNullableNumber(container.dataset.startLng) : null;
-
-            const finalLat = storedLat ?? coverageLat ?? dataLat ?? containerLat ?? 0;
-            const finalLng = storedLng ?? coverageLng ?? dataLng ?? containerLng ?? 0;
+            const { lat: finalLat, lng: finalLng } = resolveProjectCoordinates(
+                projectSettings,
+                lastCoverage,
+                data,
+                container,
+            );
 
             state.txData = { ...data };
             state.txData.coverageEngine = data.coverageEngine || data.coverage_engine || state.txData.coverageEngine;
@@ -2528,6 +2850,7 @@ function initCoverageMap() {
                 ? { ...lastCoverage, project_slug: lastCoverage.project_slug || slugCandidate }
                 : null;
             if (state.coverageData) {
+                state.coverageData.tiles = _sanitizeTileConfig(state.coverageData.tiles) || null;
                 state.coverageData.engine = state.coverageData.engine || state.txData.coverageEngine || 'p1546';
                 state.coverageData.bounds = state.coverageData.bounds || null;
                 state.coverageData.colorbar_bounds = state.coverageData.colorbar_bounds || null;

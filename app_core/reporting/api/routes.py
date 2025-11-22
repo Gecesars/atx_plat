@@ -9,7 +9,8 @@ import binascii
 from app_core.utils import project_by_slug_or_404
 from extensions import db
 
-from ..service import generate_analysis_report, AnalysisReportError, build_analysis_preview
+from ..service import generate_analysis_report, AnalysisReportError, build_analysis_preview, analyze_ai_inconsistencies
+from ..ai import AIUnavailable, AISummaryError
 from . import bp
 
 
@@ -49,6 +50,24 @@ def analysis_context():
     except AnalysisReportError as exc:
         return jsonify({'error': str(exc)}), 400
     return jsonify(context), 200
+
+
+@bp.route('/analysis/validate', methods=['POST'])
+@login_required
+def analysis_validate():
+    payload = request.get_json() or {}
+    slug = payload.get('project') or payload.get('projectSlug')
+    if not slug:
+        return jsonify({'error': 'Informe o slug do projeto.'}), 400
+    ai_sections = payload.get('ai_sections') or {}
+    if not isinstance(ai_sections, dict) or not ai_sections:
+        return jsonify({'error': 'Envie as seções do relatório para validação.'}), 400
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    try:
+        issues = analyze_ai_inconsistencies(project, ai_sections)
+    except (AnalysisReportError, AIUnavailable, AISummaryError) as exc:
+        return jsonify({'error': str(exc)}), 400
+    return jsonify({'issues': issues}), 200
 
 
 @bp.route('/coverage_ibge', methods=['GET'])

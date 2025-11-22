@@ -13,7 +13,6 @@ from flask import current_app
 from app_core.analytics.ibge_catalog import (
     _create_sidra_session,
     fetch_income_per_capita_by_state,
-    fetch_population_estimates,
     get_municipality_metadata,
     get_or_resolve_municipality,
 )
@@ -140,16 +139,23 @@ def _enrich_municipalities_with_ibge(
         return
 
     session = _create_sidra_session()
-    population_data = fetch_population_estimates(municipalities.keys(), session=session)
-
     state_codes = {info.state_id for info in municipalities.values() if info.state_id}
     income_data = fetch_income_per_capita_by_state(state_codes, session=session)
 
     for code, info in municipalities.items():
-        pop_entry = population_data.get(code)
-        if pop_entry:
-            info.population = pop_entry.get("value")
-            info.population_year = pop_entry.get("year")
+        pop_value = None
+        demographics = ibge_api.fetch_demographics_by_code(code)
+        if demographics and demographics.get("total") is not None:
+            pop_value = demographics["total"]
+            info.population_year = 2022
+        else:
+            legacy_value = ibge_api.fetch_population_legacy(code)
+            if legacy_value is not None:
+                pop_value = legacy_value
+                info.population_year = 2022
+            else:
+                info.population_year = None
+        info.population = pop_value
 
         if info.state_id:
             income_entry = income_data.get(info.state_id)
@@ -159,16 +165,19 @@ def _enrich_municipalities_with_ibge(
 
 
 def summarize_coverage_demographics(
-    summary_json_path: Path,
+    summary_json_path: Path | None = None,
     min_field_dbuvm: float = 25.0,
     cluster_precision: int = 2,
     cluster_limit: int = 400,
+    summary_payload: Optional[Dict] = None,
 ) -> Dict[str, object]:
-    if not summary_json_path.exists():
-        raise FileNotFoundError(f"Coverage summary not found: {summary_json_path}")
-
-    with summary_json_path.open("r", encoding="utf-8") as handle:
-        summary_data = json.load(handle)
+    if summary_payload is not None:
+        summary_data = dict(summary_payload)
+    else:
+        if summary_json_path is None or not summary_json_path.exists():
+            raise FileNotFoundError(f"Coverage summary not found: {summary_json_path}")
+        with summary_json_path.open("r", encoding="utf-8") as handle:
+            summary_data = json.load(handle)
 
     signal_dict = summary_data.get("signal_level_dict") or {}
     points = _parse_signal_dict(signal_dict, min_field_dbuvm)

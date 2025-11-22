@@ -19,6 +19,8 @@
     const logoInput = document.getElementById('companyLogoInput');
     const logoPreview = document.getElementById('companyLogoPreview');
     const logoRemoveBtn = document.getElementById('companyLogoRemoveBtn');
+    const validationList = document.getElementById('validationIssues');
+    const validateBtn = document.getElementById('validateBtn');
 
     const fields = {
         headerColor: document.getElementById('inputHeaderColor'),
@@ -30,6 +32,22 @@
         patternV: document.getElementById('inputPatternV'),
         conclusion: document.getElementById('inputConclusion'),
     };
+    const targetFieldMap = {
+        overview: fields.overview,
+        coverage: fields.coverage,
+        profile: fields.profile,
+        pattern_horizontal: fields.patternH,
+        pattern_vertical: fields.patternV,
+        conclusion: fields.conclusion,
+    };
+    const fieldLabels = {
+        overview: 'Resumo executivo',
+        coverage: 'Cobertura',
+        profile: 'Perfil do enlace',
+        pattern_horizontal: 'Direcionalidade Horizontal',
+        pattern_vertical: 'Direcionalidade Vertical',
+        conclusion: 'Conclusão',
+    };
 
     const state = {
         aiSections: {},
@@ -38,6 +56,8 @@
         projectNotes: '',
         contextLoaded: false,
         companyLogo: null,
+        validationIssues: [],
+        isValidating: false,
     };
 
     const notify = (message, variant = 'info') => {
@@ -79,17 +99,126 @@
         }
         rows.forEach((entry) => {
             const row = document.createElement('tr');
-            ['label', 'municipality', 'distance_km', 'power_dbm', 'population'].forEach((key) => {
+            ['label', 'municipality', 'distance_km', 'field_dbuv_m', 'population'].forEach((key) => {
                 const cell = document.createElement('td');
                 let value = entry[key];
                 if (key === 'distance_km' && value != null) value = `${Number(value).toFixed(1)} km`;
-                if (key === 'power_dbm' && value != null) value = `${Number(value).toFixed(1)} dBm`;
+                if (key === 'field_dbuv_m' && value != null) value = `${Number(value).toFixed(1)} dBµV/m`;
                 if (key === 'population' && value) value = value.toLocaleString('pt-BR');
                 cell.textContent = value ?? '—';
                 row.appendChild(cell);
             });
             receiversTable.appendChild(row);
         });
+    };
+
+    const collectAiSections = () => ({
+        overview: fields.overview.value || '',
+        coverage: fields.coverage.value || '',
+        profile: fields.profile.value || '',
+        pattern_horizontal: fields.patternH.value || '',
+        pattern_vertical: fields.patternV.value || '',
+        conclusion: fields.conclusion.value || '',
+        recommendations: state.recommendations.slice(),
+    });
+
+    const setValidationLoading = (isLoading) => {
+        state.isValidating = isLoading;
+        if (validateBtn) {
+            validateBtn.disabled = isLoading;
+            validateBtn.textContent = isLoading ? 'Verificando...' : 'Verificar inconsistências';
+        }
+    };
+
+    const applyIssueCorrection = (index) => {
+        const issue = state.validationIssues[index];
+        if (!issue) return;
+        const fieldEl = targetFieldMap[issue.field];
+        if (fieldEl && issue.corrected_text) {
+            fieldEl.value = issue.corrected_text;
+        }
+        state.validationIssues.splice(index, 1);
+        renderValidationIssues();
+        notify('Correção aplicada.', 'success');
+    };
+
+    const renderValidationIssues = () => {
+        Object.values(targetFieldMap).forEach((input) => {
+            if (input) input.classList.remove('field-invalid');
+        });
+        if (!validationList) return;
+        validationList.innerHTML = '';
+        if (!state.validationIssues.length) {
+            validationList.innerHTML = '<p class="text-muted mb-0 small">Nenhuma verificação realizada.</p>';
+            return;
+        }
+        state.validationIssues.forEach((issue, index) => {
+            const fieldKey = issue.field;
+            const fieldEl = targetFieldMap[fieldKey];
+            if (fieldEl) {
+                fieldEl.classList.add('field-invalid');
+            }
+            const wrapper = document.createElement('div');
+            wrapper.className = 'validation-issue';
+            const label = fieldLabels[fieldKey] || fieldKey;
+            const severity = (issue.severity || 'warning').toLowerCase();
+            const badgeClass = severity === 'error' ? 'bg-danger' : 'bg-warning text-dark';
+            wrapper.innerHTML = `
+                <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+                    <h6 class="mb-0">${label}</h6>
+                    <span class="badge ${badgeClass} text-uppercase">${severity}</span>
+                </div>
+                <p class="mb-1">${issue.issue || 'Inconsistência detectada.'}</p>
+                ${issue.evidence ? `<p class="mb-0"><strong>Evidência:</strong> ${issue.evidence}</p>` : ''}
+            `;
+            if (issue.corrected_text) {
+                const actions = document.createElement('div');
+                actions.className = 'issue-actions';
+                const applyBtn = document.createElement('button');
+                applyBtn.type = 'button';
+                applyBtn.className = 'btn btn-sm btn-outline-danger';
+                applyBtn.textContent = 'Corrigir';
+                applyBtn.addEventListener('click', () => applyIssueCorrection(index));
+                actions.appendChild(applyBtn);
+                wrapper.appendChild(actions);
+            }
+            validationList.appendChild(wrapper);
+        });
+    };
+
+    const runValidation = () => {
+        if (!projectSlug) return;
+        setValidationLoading(true);
+        const payload = {
+            project: projectSlug,
+            ai_sections: collectAiSections(),
+        };
+        fetch('/api/reports/analysis/validate', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'same-origin',
+            body: JSON.stringify(payload),
+        })
+            .then((response) => {
+                if (!response.ok) {
+                    return response.json().catch(() => ({})).then((json) => {
+                        throw new Error(json.error || 'Não foi possível verificar as inconsistências.');
+                    });
+                }
+                return response.json();
+            })
+            .then((data) => {
+                state.validationIssues = Array.isArray(data.issues) ? data.issues : [];
+                if (!state.validationIssues.length) {
+                    notify('Nenhuma inconsistência encontrada.');
+                }
+                renderValidationIssues();
+            })
+            .catch((error) => {
+                console.error(error);
+                notify(error.message || 'Falha ao verificar inconsistências.', 'danger');
+            })
+            .finally(() => setValidationLoading(false));
     };
 
     const applyContext = (data) => {
@@ -101,6 +230,7 @@
             ? state.aiSections.recommendations.slice()
             : [];
         state.companyLogo = data.branding?.company_logo || null;
+        state.validationIssues = [];
 
         fields.headerColor.value = state.headerColor;
         fields.projectNotes.value = state.projectNotes;
@@ -111,8 +241,9 @@
         fields.patternV.value = state.aiSections.pattern_vertical || '';
         fields.conclusion.value = state.aiSections.conclusion || '';
 
-        if (coverageImg && data.coverage?.heatmap_url) {
-            coverageImg.src = data.coverage.heatmap_url;
+        const coveragePreviewSrc = data.coverage?.map_snapshot_url || data.coverage?.heatmap_url;
+        if (coverageImg && coveragePreviewSrc) {
+            coverageImg.src = coveragePreviewSrc;
         }
         if (colorbarImg && data.coverage?.colorbar_url) {
             colorbarImg.src = data.coverage.colorbar_url;
@@ -142,6 +273,7 @@
         if (linkSummaryBlock) {
             linkSummaryBlock.textContent = data.link_summary || 'Nenhum receptor cadastrado.';
         }
+        renderValidationIssues();
         if (statusBanner) statusBanner.classList.add('d-none');
         app.classList.remove('d-none');
     };
@@ -274,6 +406,10 @@
         logoRemoveBtn.addEventListener('click', () => {
             uploadCompanyLogo(null);
         });
+    }
+
+    if (validateBtn) {
+        validateBtn.addEventListener('click', runValidation);
     }
 
     loadContext();

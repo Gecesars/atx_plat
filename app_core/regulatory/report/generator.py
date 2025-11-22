@@ -4,7 +4,7 @@ import io
 import zipfile
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Tuple
 
 from flask import current_app
 from jinja2 import Environment, FileSystemLoader, select_autoescape
@@ -54,8 +54,8 @@ class RegulatoryReportGenerator:
         template = self.env.get_template('relatorio_base.html')
         return template.render(**context)
 
-    def _render_with_reportlab(self, html: str, output_path: Path) -> None:
-        c = canvas.Canvas(str(output_path), pagesize=A4)
+    def _render_with_reportlab(self, html: str, target) -> None:
+        c = canvas.Canvas(target, pagesize=A4)
         textobject = c.beginText(40, A4[1] - 40)
         for line in html.splitlines():
             textobject.textLine(line[:110])
@@ -63,19 +63,22 @@ class RegulatoryReportGenerator:
         c.showPage()
         c.save()
 
-    def generate_pdf(self, html: str, output_path: Path) -> None:
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+    def generate_pdf_bytes(self, html: str) -> bytes:
+        buffer = io.BytesIO()
         if HTML:
-            HTML(string=html, base_url=str(Path(current_app.root_path))).write_pdf(str(output_path))
+            HTML(string=html, base_url=str(Path(current_app.root_path))).write_pdf(buffer)
         else:  # pragma: no cover
-            self._render_with_reportlab(html, output_path)
+            self._render_with_reportlab(html, buffer)
+        buffer.seek(0)
+        return buffer.read()
 
-    def build_zip(self, pdf_path: Path, attachments: Iterable[Path], output_dir: Path) -> Path:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        zip_path = output_dir / 'mosaico_submit.zip'
-        with zipfile.ZipFile(zip_path, 'w', compression=zipfile.ZIP_DEFLATED) as bundle:
-            bundle.write(pdf_path, arcname='relatorio.pdf')
-            for attachment in attachments:
-                if attachment and attachment.exists():
-                    bundle.write(attachment, arcname=attachment.name)
-        return zip_path
+    def build_zip_bytes(self, pdf_bytes: bytes, attachments: Iterable[Tuple[str, bytes]]) -> bytes:
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w', compression=zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr('relatorio.pdf', pdf_bytes)
+            for name, payload in attachments:
+                if not payload or not name:
+                    continue
+                bundle.writestr(name, payload)
+        buffer.seek(0)
+        return buffer.read()

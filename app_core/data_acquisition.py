@@ -1,9 +1,10 @@
 
+import io
 import json
 import math
-import os
 import statistics
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -15,7 +16,7 @@ from pycraf import pathprof
 from shapely.geometry import Polygon
 
 from .models import Asset, AssetType, DatasetSource, DatasetSourceKind, db
-from .storage import ensure_project_path_exists, get_project_asset_path, storage_root
+from .storage import inline_asset_path
 
 MAPBIOMAS_AVAILABLE_YEARS = list(range(1985, 2024))
 _MAPBIOMAS_DEFAULT_YEAR = MAPBIOMAS_AVAILABLE_YEARS[-1]
@@ -49,47 +50,6 @@ def global_srtm_dir() -> Path:
     base = Path(current_app.root_path).parent / "SRTM"
     base.mkdir(parents=True, exist_ok=True)
     return base
-
-
-def _rehydrate_asset(
-    project,
-    asset_type,
-    filename,
-    source_kind,
-    notes,
-    meta,
-    size=None,
-    locator=None,
-    mime_type='application/octet-stream',
-):
-    """Cria registros de Source/Asset quando o arquivo já existe localmente."""
-    try:
-        source = DatasetSource(
-            project_id=project.id,
-            kind=source_kind,
-            locator=locator or {},
-            notes=notes,
-        )
-        db.session.add(source)
-        db.session.flush()
-    except Exception:
-        db.session.rollback()
-        current_app.logger.warning("Não foi possível registrar fonte %s para %s", source_kind, filename)
-        return None
-
-    rel_path = get_project_asset_path(project, asset_type, filename)
-    asset = Asset(
-        project_id=project.id,
-        type=asset_type,
-        path=rel_path,
-        mime_type=mime_type,
-        byte_size=size,
-        meta=meta,
-        source_id=source.id,
-    )
-    db.session.add(asset)
-    db.session.commit()
-    return asset
 
 
 def _hgt_tile_name(lat: float, lon: float) -> str:
@@ -129,13 +89,17 @@ def download_srtm_tile(project, lat, lon):
         return None
 
     local_path = matches[0]
-    rel_path = os.path.relpath(local_path, storage_root())
 
-    existing = Asset.query.filter_by(project_id=project.id, path=rel_path).order_by(Asset.created_at.desc()).first()
-    if existing:
+    existing = (
+        Asset.query.filter_by(project_id=project.id, type=AssetType.dem)
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if existing and (existing.meta or {}).get('tile') == tile_name:
         return existing
 
-    file_size = os.path.getsize(local_path)
+    payload = local_path.read_bytes()
+    file_size = len(payload)
     source = DatasetSource(
         project_id=project.id,
         kind=DatasetSourceKind.SRTM,
@@ -147,10 +111,11 @@ def download_srtm_tile(project, lat, lon):
 
     asset = Asset(
         project_id=project.id,
-        type='dem',
-        path=rel_path,
+        type=AssetType.dem,
+        path=inline_asset_path('dem', local_path.suffix or 'hgt'),
         mime_type='application/octet-stream',
         byte_size=file_size,
+        data=payload,
         meta={'source': 'SRTM1 viewpano', 'tile': tile_name, 'resolution': '1 arc-second'},
         source_id=source.id,
     )
@@ -168,41 +133,26 @@ def download_mapbiomas_tile(project, year):
     tile_name = f"brazil_coverage_{year}.tif"
     url = f"{MAPBIOMAS_BASE_URL}/{tile_name}"
 
-    asset_filename = f"mapbiomas_collection10_{year}.tif"
-    asset_folder = ensure_project_path_exists(project, 'assets', 'lulc')
-    local_path = os.path.join(asset_folder, asset_filename)
-    rel_path = get_project_asset_path(project, 'lulc', asset_filename)
+    existing = (
+        Asset.query.filter_by(project_id=project.id, type=AssetType.lulc)
+        .order_by(Asset.created_at.desc())
+        .first()
+    )
+    if existing and (existing.meta or {}).get('year') == year:
+        return existing
 
-    if os.path.exists(local_path):
-        current_app.logger.info(f"MapBiomas tile {asset_filename} already exists for project {project.slug}.")
-        existing = Asset.query.filter_by(project_id=project.id, path=rel_path).order_by(Asset.created_at.desc()).first()
-        if existing:
-            return existing
-        size = os.path.getsize(local_path)
-        meta = {'source': 'MapBiomas Collection 10', 'year': year, 'rehydrated': True}
-        return _rehydrate_asset(
-            project,
-            'lulc',
-            asset_filename,
-            DatasetSourceKind.MAPBIOMAS,
-            f"MapBiomas Collection 10 tile {year} (rehydratado).",
-            meta,
-            size=size,
-            locator={'url': url},
-            mime_type='image/tiff',
-        )
-
-    current_app.logger.info(f"Downloading MapBiomas tile from {url} to {local_path}")
+    current_app.logger.info(f"Downloading MapBiomas tile for {year} from {url}")
 
     try:
         response = requests.get(url, stream=True)
         response.raise_for_status()
 
-        with open(local_path, 'wb') as f:
-            for chunk in response.iter_content(chunk_size=8192):
-                f.write(chunk)
-        
-        file_size = os.path.getsize(local_path)
+        buffer = io.BytesIO()
+        for chunk in response.iter_content(chunk_size=8192):
+            if chunk:
+                buffer.write(chunk)
+        payload = buffer.getvalue()
+        file_size = len(payload)
 
         source = DatasetSource(
             project_id=project.id,
@@ -215,17 +165,18 @@ def download_mapbiomas_tile(project, year):
 
         asset = Asset(
             project_id=project.id,
-            type='lulc',
-            path=rel_path,
+            type=AssetType.lulc,
+            path=inline_asset_path('lulc', 'tif'),
             mime_type='image/tiff',
             byte_size=file_size,
+            data=payload,
             meta={'source': 'MapBiomas Collection 10', 'year': year},
             source_id=source.id
         )
         db.session.add(asset)
         db.session.commit()
 
-        current_app.logger.info(f"Successfully downloaded and created asset for {asset_filename}.")
+        current_app.logger.info("Successfully downloaded MapBiomas tile for %s.", year)
         return asset
 
     except requests.exceptions.RequestException as e:
@@ -466,14 +417,7 @@ def _fetch_overpass_buildings(lat: float, lon: float, radius_km: float) -> Optio
 def _write_scene_asset(project, scene_data: Dict, radius_km: float):
     summary = scene_data.setdefault("summary", {})
     summary.setdefault("radius_km", radius_km)
-    asset_folder = ensure_project_path_exists(project, "assets", "buildings")
-    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-    filename = f"rt3d_scene_{timestamp}.geojson"
-    local_path = os.path.join(asset_folder, filename)
-    with open(local_path, "w", encoding="utf-8") as fh:
-        json.dump(scene_data, fh)
-    rel_path = get_project_asset_path(project, "buildings", filename)
-    size_bytes = os.path.getsize(local_path)
+    payload = json.dumps(scene_data).encode("utf-8")
 
     source = DatasetSource(
         project_id=project.id,
@@ -487,9 +431,10 @@ def _write_scene_asset(project, scene_data: Dict, radius_km: float):
     asset = Asset(
         project_id=project.id,
         type=AssetType.building_footprints,
-        path=rel_path,
+        path=f"inline://buildings/{uuid.uuid4().hex}.geojson",
         mime_type="application/geo+json",
-        byte_size=size_bytes,
+        byte_size=len(payload),
+        data=payload,
         meta={
             "radius_km": radius_km,
             "source": "osm-overpass",
@@ -499,42 +444,45 @@ def _write_scene_asset(project, scene_data: Dict, radius_km: float):
     )
     db.session.add(asset)
     db.session.commit()
-    return asset, rel_path
+    return asset, asset.path
 
 
-def _load_cached_scene(asset_folder: Path):
-    if not asset_folder.exists():
-        return None
-    files = sorted(
-        asset_folder.glob("rt3d_scene_*.geojson"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+def _load_cached_scene(project):
+    asset = (
+        Asset.query.filter_by(project_id=project.id, type=AssetType.building_footprints)
+        .order_by(Asset.created_at.desc())
+        .first()
     )
-    now = time.time()
-    for file_path in files:
-        if now - file_path.stat().st_mtime > RT3D_SCENE_MAX_CACHE_AGE_SECONDS:
-            continue
-        try:
-            with open(file_path, "r", encoding="utf-8") as fh:
-                data = json.load(fh)
-        except Exception:
-            continue
-        summary = data.get("summary") or {}
-        if not summary.get("points"):
-            continue
-        rel_path = os.path.relpath(file_path, storage_root())
-        return {
-            "source": summary.get("source", "osm-overpass"),
-            "points": summary.get("points"),
-            "median_height": summary.get("median_height"),
-            "asset_path": rel_path,
-            "feature_count": len(data.get("features", [])),
-            "generated_at": datetime.utcnow().isoformat(),
-            "cache": True,
-            "origin": summary.get("origin"),
-            "radius_km": summary.get("radius_km"),
-        }
-    return None
+    if not asset:
+        return None
+    if asset.created_at:
+        age = (datetime.utcnow() - asset.created_at).total_seconds()
+        if age > RT3D_SCENE_MAX_CACHE_AGE_SECONDS:
+            return None
+    payload = None
+    if asset.data:
+        payload = asset.data
+    if not payload:
+        return None
+    try:
+        data = json.loads(payload.decode("utf-8"))
+    except Exception:
+        return None
+    summary = data.get("summary") or {}
+    if not summary.get("points"):
+        return None
+    return {
+        "source": summary.get("source", "osm-overpass"),
+        "points": summary.get("points"),
+        "median_height": summary.get("median_height"),
+        "asset_path": asset.path,
+        "asset_id": str(asset.id),
+        "feature_count": len(data.get("features", [])),
+        "generated_at": datetime.utcnow().isoformat(),
+        "cache": True,
+        "origin": summary.get("origin"),
+        "radius_km": summary.get("radius_km"),
+    }
 
 
 def ensure_rt3d_scene(
@@ -553,9 +501,7 @@ def ensure_rt3d_scene(
         return None
 
     radius_km = max(float(radius_km or 3.0), 0.5)
-    asset_folder = ensure_project_path_exists(project, "assets", "buildings")
-
-    cached = _load_cached_scene(Path(asset_folder))
+    cached = _load_cached_scene(project)
     if cached:
         current_app.logger.info(
             "rt3d.scene.cache_hit",
@@ -600,6 +546,7 @@ def ensure_rt3d_scene(
         "origin": {"lat": latitude, "lon": longitude},
         "radius_km": radius_km,
         "asset_path": rel_path,
+        "asset_id": str(asset.id),
         "feature_count": len(overpass_scene.get("features", [])),
         "points": points,
         "median_height": summary.get("median_height"),

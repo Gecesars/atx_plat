@@ -14,8 +14,11 @@
             <h1 class="h3 mb-0">{{ project.name }}</h1>
             <small class="text-muted">Slug: {{ project.slug }}</small>
         </div>
-        <div class="d-flex gap-2">
+        <div class="d-flex gap-2 flex-wrap">
             <a class="btn btn-outline-secondary" href="{{ url_for('ui.home') }}">Voltar</a>
+            <button class="btn btn-outline-danger" id="validateBtn" {% if not has_snapshot %}disabled{% endif %}>
+                Verificar inconsistências
+            </button>
             <button class="btn btn-brand" id="generatePdfBtn" {% if not has_snapshot %}disabled{% endif %}>
                 Gerar PDF
             </button>
@@ -70,7 +73,7 @@
                                     <th>Receptor</th>
                                     <th>Município</th>
                                     <th>Distância</th>
-                                    <th>Potência</th>
+                                    <th>Campo</th>
                                     <th>População</th>
                                 </tr>
                             </thead>
@@ -125,6 +128,10 @@
                 <div class="editor-card">
                     <p class="section-title">Recomendações</p>
                     <div class="recommendations-list" id="recommendationsList"></div>
+                </div>
+                <div class="editor-card mt-4" id="validationPanel">
+                    <p class="section-title">Inconsistências do relatório</p>
+                    <div id="validationIssues" class="validation-issues text-muted small">Nenhuma verificação realizada.</div>
                 </div>
                 <div class="editor-card mt-4">
                     <p class="section-title">Resumo dos receptores</p>

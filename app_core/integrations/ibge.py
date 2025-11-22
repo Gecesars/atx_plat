@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import json
 import logging
 import unicodedata
 from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
 from urllib.parse import urlencode
 
 import requests
 from flask import current_app
+
+try:
+    from openpyxl import load_workbook
+except ImportError:  # pragma: no cover - fallback caso openpyxl não esteja disponível
+    load_workbook = None
 
 
 # -------------------------------
@@ -92,6 +99,13 @@ STATE_ALIASES = {
 }
 
 
+ROOT_DIR = Path(__file__).resolve().parents[2]
+_LOCAL_DATASET_PATH = ROOT_DIR / "data" / "ibge_population_income.json"
+_POPULATION_XLSX = ROOT_DIR / "docs" / "CD2022_Populacao_Coletada_Imputada_e_Total_Municipio_e_UF_20231222.xlsx"
+_INCOME_XLSX = ROOT_DIR / "docs" / "Agregados_por_municipios_renda_responsavel_BR.xlsx"
+_LOCAL_DATASET: Dict[str, Any] | None = None
+
+
 def _log(event: str, level: int = logging.WARNING, **extra):
     """Logger seguro (funciona dentro/fora do contexto Flask)."""
     logger = logging.getLogger("ibge_service")
@@ -117,6 +131,140 @@ def _slugify(value: str) -> str:
         ascii_text = ascii_text.replace(old, new)
     ascii_text = ascii_text.replace("-", " ").replace("_", " ")
     return " ".join(ascii_text.split())
+
+
+def _coerce_int(value) -> int | None:
+    if value in (None, "", "-", "..."):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return int(value)
+        cleaned = str(value).strip().replace(".", "").replace(",", ".")
+        return int(float(cleaned))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value) -> float | None:
+    if value in (None, "", "-", "..."):
+        return None
+    try:
+        if isinstance(value, (int, float)):
+            return float(value)
+        cleaned = str(value).strip().replace(" ", "").replace(".", "").replace(",", ".")
+        return float(cleaned)
+    except (TypeError, ValueError):
+        return None
+
+
+def _build_dataset_from_xlsx() -> Dict[str, Any]:
+    dataset: Dict[str, Any] = {}
+    if load_workbook is None:
+        return dataset
+
+    if _POPULATION_XLSX.exists():
+        wb = load_workbook(_POPULATION_XLSX, read_only=True, data_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=3, values_only=True):
+            uf = row[1]
+            cod_uf = row[2]
+            cod_munic = row[3]
+            name = row[4]
+            total = row[7] if len(row) > 7 else None
+            if not uf or uf == "UF":
+                continue
+            try:
+                uf_code = int(cod_uf)
+                city_code = str(cod_munic).zfill(5)
+                code = f"{uf_code:02d}{city_code}"
+            except (TypeError, ValueError):
+                continue
+            population = _coerce_int(total)
+            if population is None:
+                continue
+            dataset[str(code)] = {
+                "code": str(code),
+                "name": name,
+                "state": uf,
+                "population": population,
+                "population_year": 2022,
+            }
+
+    if _INCOME_XLSX.exists():
+        wb = load_workbook(_INCOME_XLSX, read_only=True, data_only=True)
+        ws = wb.active
+        for row in ws.iter_rows(min_row=2, values_only=True):
+            code = row[0]
+            if not code:
+                continue
+            entry = dataset.setdefault(str(code), {"code": str(code)})
+            per_capita = _coerce_float(row[5] if len(row) > 5 else None)
+            total_income = _coerce_float(row[6] if len(row) > 6 else None)
+            if per_capita is not None:
+                entry["income_per_capita"] = per_capita
+                entry["income_year"] = 2022
+            if total_income is not None:
+                entry["income_total"] = total_income
+                entry["income_total_year"] = 2022
+
+    if dataset:
+        payload = {
+            "generated_at": None,
+            "municipalities": dataset,
+        }
+        try:
+            _LOCAL_DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)
+            _LOCAL_DATASET_PATH.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+        except OSError:
+            pass
+    return dataset
+
+
+def _load_local_dataset() -> Dict[str, Any]:
+    global _LOCAL_DATASET
+    if _LOCAL_DATASET is not None:
+        return _LOCAL_DATASET
+    if not _LOCAL_DATASET_PATH.exists():
+        if _POPULATION_XLSX.exists() and _INCOME_XLSX.exists():
+            _LOCAL_DATASET = _build_dataset_from_xlsx()
+        else:
+            _LOCAL_DATASET = {}
+        return _LOCAL_DATASET
+    try:
+        payload = json.loads(_LOCAL_DATASET_PATH.read_text())
+        municipalities = payload.get("municipalities") or {}
+        _LOCAL_DATASET = {str(code): data for code, data in municipalities.items()}
+    except Exception as exc:
+        _log("ibge.local_dataset.load_failed", level=logging.ERROR, error=str(exc))
+        if _POPULATION_XLSX.exists() and _INCOME_XLSX.exists():
+            _LOCAL_DATASET = _build_dataset_from_xlsx()
+        else:
+            _LOCAL_DATASET = {}
+    return _LOCAL_DATASET
+
+
+def _local_lookup_by_code(code: str | None) -> Dict[str, Any] | None:
+    if not code:
+        return None
+    dataset = _load_local_dataset()
+    return dataset.get(str(code))
+
+
+def _local_lookup_by_city(city: str | None, state: str | None) -> Dict[str, Any] | None:
+    if not city:
+        return None
+    dataset = _load_local_dataset()
+    if not dataset:
+        return None
+    normalized_state = normalize_state_code(state) if state else None
+    city_slug = _slugify(city)
+    for entry in dataset.values():
+        if _slugify(entry.get("name")) != city_slug:
+            continue
+        if normalized_state and normalize_state_code(entry.get("state")) != normalized_state:
+            continue
+        return entry
+    return None
 
 
 def normalize_state_code(value: str | None) -> str | None:
@@ -166,6 +314,9 @@ def _build_demographics_url(code: str, classificacoes: Optional[dict[int, Iterab
 def resolve_municipality_code(city: str | None, state: str | None = None) -> str | None:
     if not city:
         return None
+    entry = _local_lookup_by_city(city, state)
+    if entry and entry.get("code"):
+        return str(entry["code"])
     # normaliza a consulta para melhor acerto/cache
     params = {"nome": _slugify(city)}
     try:
@@ -174,10 +325,12 @@ def resolve_municipality_code(city: str | None, state: str | None = None) -> str
         candidates = resp.json()
     except Exception as exc:
         _log("ibge.lookup_failed", city=city, state=state, error=str(exc))
-        return None
+        entry = _local_lookup_by_city(city, state)
+        return str(entry["code"]) if entry and entry.get("code") else None
 
     if not candidates:
-        return None
+        entry = _local_lookup_by_city(city, state)
+        return str(entry["code"]) if entry and entry.get("code") else None
 
     normalized_state = normalize_state_code(state) if state else None
 
@@ -195,7 +348,10 @@ def resolve_municipality_code(city: str | None, state: str | None = None) -> str
                 return str(code)
 
     code = candidates[0].get("id")
-    return str(code) if code else None
+    if code:
+        return str(code)
+    entry = _local_lookup_by_city(city, state)
+    return str(entry["code"]) if entry and entry.get("code") else None
 
 
 def _parse_total_from_payload(payload) -> Optional[int]:
@@ -276,6 +432,7 @@ def fetch_demographics_by_code(code: str | None) -> Dict[str, Any] | None:
     if not code:
         return None
 
+    local_entry = _local_lookup_by_code(code)
     payload_total = None
     payload_sex = None
     payload_age = None
@@ -322,12 +479,33 @@ def fetch_demographics_by_code(code: str | None) -> Dict[str, Any] | None:
 
     # Se nada deu certo:
     if total is None and not sex_breakdown and not age_breakdown:
+        if local_entry and local_entry.get("population") is not None:
+            return {
+                "code": code,
+                "total": local_entry["population"],
+                "sex": {},
+                "age": {},
+                "period": local_entry.get("population_year"),
+                "raw": None,
+            }
         return None
+    period_value = None
+    if payload_total and isinstance(payload_total, list) and payload_total:
+        first_result = payload_total[0].get("resultados", [])
+        if first_result:
+            period_keys = []
+            for serie in first_result[0].get("series", []):
+                period_keys.extend(list((serie.get("serie") or {}).keys()))
+            if period_keys:
+                period_value = period_keys[-1]
+    if not period_value and local_entry:
+        period_value = local_entry.get("population_year")
     return {
         "code": code,
         "total": total,
         "sex": sex_breakdown,
         "age": age_breakdown,
+        "period": period_value,
         "raw": {
             "total": payload_total,
             "sex": payload_sex,
@@ -346,6 +524,9 @@ def fetch_population_legacy(code: str | None) -> int | None:
         payload = resp.json()
     except Exception as exc:
         _log("ibge.population_failed", code=code, error=str(exc))
+        entry = _local_lookup_by_code(code)
+        if entry:
+            return entry.get("population")
         return None
 
     serie = (
@@ -360,17 +541,38 @@ def fetch_population_legacy(code: str | None) -> int | None:
         if value not in (None, "")
     ]
     values = [v for v in values if v is not None]
-    return values[-1] if values else None
+    if values:
+        return values[-1]
+    entry = _local_lookup_by_code(code)
+    return entry.get("population") if entry else None
 
 
 def fetch_demographics_by_city(city: str | None, state: str | None = None) -> Dict[str, Any] | None:
     code = resolve_municipality_code(city, state)
     if not code:
+        entry = _local_lookup_by_city(city, state)
+        if entry and entry.get("population") is not None:
+            return {
+                "code": entry["code"],
+                "total": entry["population"],
+                "sex": {},
+                "age": {},
+                "raw": None,
+            }
         return None
     data = fetch_demographics_by_code(code)
     if data:
         return data
     total = fetch_population_legacy(code)
     if total is None:
+        entry = _local_lookup_by_code(code)
+        if entry and entry.get("population") is not None:
+            return {
+                "code": code,
+                "total": entry["population"],
+                "sex": {},
+                "age": {},
+                "raw": None,
+            }
         return None
     return {"code": code, "total": total, "sex": {}, "age": {}, "raw": None}

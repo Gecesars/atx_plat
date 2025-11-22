@@ -1,7 +1,6 @@
 import os
 import platform
 from datetime import datetime
-from pathlib import Path
 
 from dotenv import load_dotenv
 from flask import Flask
@@ -77,9 +76,9 @@ def create_app():
         os.path.join(STATIC_DIR, 'SOLID_PRT_ASM', 'PNGS'),
     )
 
-    storage_root = os.environ.get('STORAGE_ROOT', os.path.join(BASE_DIR, 'storage'))
-    Path(storage_root).mkdir(parents=True, exist_ok=True)
-    app.config['STORAGE_ROOT'] = storage_root
+    legacy_root = os.environ.get('LEGACY_STORAGE_ROOT') or os.environ.get('STORAGE_ROOT')
+    if legacy_root:
+        app.config['LEGACY_STORAGE_ROOT'] = legacy_root
 
     db.init_app(app)
     Migrate(app, db)

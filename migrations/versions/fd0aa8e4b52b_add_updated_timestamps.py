@@ -18,7 +18,15 @@ branch_labels = None
 depends_on = None
 
 
+def _has_column(table_name: str, column_name: str) -> bool:
+    bind = op.get_bind()
+    inspector = sa.inspect(bind)
+    return column_name in {col["name"] for col in inspector.get_columns(table_name)}
+
+
 def _add_column_with_default(table_name: str) -> None:
+    if _has_column(table_name, "updated_at"):
+        return
     with op.batch_alter_table(table_name) as batch_op:
         batch_op.add_column(
             sa.Column(
@@ -37,5 +45,6 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     for table in ("assets", "coverage_jobs", "reports", "dataset_sources"):
-        with op.batch_alter_table(table) as batch_op:
-            batch_op.drop_column("updated_at")
+        if _has_column(table, "updated_at"):
+            with op.batch_alter_table(table) as batch_op:
+                batch_op.drop_column("updated_at")

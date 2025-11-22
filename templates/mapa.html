@@ -74,6 +74,11 @@
             </div>
 
             <button class="btn btn-brand w-100" id="btnGenerateCoverage" data-bs-toggle="tooltip" title="Executar o motor de propagação com os parâmetros atuais.">Gerar cobertura</button>
+            {% if project %}
+                <a class="btn btn-outline-secondary w-100 mt-2" href="{{ url_for('ui.download_coverage_kml', slug=project.slug) }}" target="_blank" rel="noopener">
+                    Exportar KML
+                </a>
+            {% endif %}
             <div class="coverage-status-badge" id="coverageStatus" hidden></div>
         </div>
 
@@ -254,6 +259,10 @@
                     <dt>Terreno RX</dt>
                     <dd id="linkElevation">-</dd>
                 </div>
+                <div>
+                    <dt>População</dt>
+                    <dd id="linkPopulation">-</dd>
+                </div>
             </dl>
         </div>
 
@@ -273,6 +282,15 @@
         </div>
         <div class="map-floating-card tx-card" id="txLegend" hidden></div>
         <div class="map-floating-card" id="mapTooltip" hidden></div>
+        <button type="button" class="map-refresh-btn" id="refreshMapData" aria-label="Atualizar dados do projeto">
+            <span class="icon" aria-hidden="true">⟳</span>
+            <span class="label">Atualizar dados</span>
+        </button>
+        <div id="rxContextMenu" class="rx-context-menu" hidden>
+            <button type="button" data-action="move">Deslocar no mapa</button>
+            <button type="button" data-action="profile">Ver perfil até o TX</button>
+            <button type="button" data-action="delete" class="text-danger">Apagar</button>
+        </div>
     </div>
 </section>
 

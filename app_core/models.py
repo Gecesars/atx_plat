@@ -97,6 +97,12 @@ class Project(TimestampMixin, db.Model):
     dataset_sources = db.relationship(
         "DatasetSource", back_populates="project", cascade="all, delete-orphan"
     )
+    receivers = db.relationship(
+        "ProjectReceiver", back_populates="project", cascade="all, delete-orphan"
+    )
+    coverages = db.relationship(
+        "ProjectCoverage", back_populates="project", cascade="all, delete-orphan"
+    )
 
     @validates("slug")
     def _normalize_slug(self, key, value):
@@ -123,6 +129,7 @@ class Asset(TimestampMixin, db.Model):
     path = db.Column(db.String(512), nullable=False)
     mime_type = db.Column(db.String(128), nullable=True)
     byte_size = db.Column(db.BigInteger, nullable=True)
+    data = db.Column(db.LargeBinary, nullable=True)
     checksum_sha256 = db.Column(db.String(64), nullable=True)
     meta = db.Column(db.JSON, nullable=True)
 
@@ -135,11 +142,6 @@ class Asset(TimestampMixin, db.Model):
         passive_deletes=True,
         lazy="dynamic",
     )
-
-    def get_full_path(self):
-        from flask import current_app
-        return current_app.config['STORAGE_ROOT'] / self.path
-
 
 class CoverageJob(TimestampMixin, db.Model):
     __tablename__ = "coverage_jobs"
@@ -198,6 +200,73 @@ class Report(TimestampMixin, db.Model):
 
     project = db.relationship("Project", back_populates="reports")
     pdf_asset = db.relationship("Asset", foreign_keys=[pdf_asset_id])
+
+
+class ProjectReceiver(TimestampMixin, db.Model):
+    __tablename__ = "project_receivers"
+    project_id = db.Column(
+        GUID(),
+        db.ForeignKey("projects.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    legacy_id = db.Column(db.String(128), primary_key=True)
+    label = db.Column(db.String(255), nullable=True)
+    latitude = db.Column(db.Float, nullable=True)
+    longitude = db.Column(db.Float, nullable=True)
+    municipality = db.Column(db.String(255), nullable=True)
+    state = db.Column(db.String(64), nullable=True)
+    summary = db.Column(db.JSON, nullable=True)
+    ibge_code = db.Column(db.String(16), nullable=True)
+    population = db.Column(db.Integer, nullable=True)
+    population_year = db.Column(db.Integer, nullable=True)
+    profile_asset_id = db.Column(
+        db.String(36),
+        db.ForeignKey("assets.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    project = db.relationship("Project", back_populates="receivers")
+    profile_asset = db.relationship("Asset")
+
+
+class ProjectCoverage(TimestampMixin, db.Model):
+    __tablename__ = "project_coverages"
+    id = db.Column(GUID(), primary_key=True, default=uuid.uuid4)
+    project_id = db.Column(
+        GUID(),
+        db.ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    engine = db.Column(db.String(32), nullable=True)
+    generated_at = db.Column(db.DateTime(timezone=True), nullable=True)
+    payload = db.Column(db.JSON, nullable=True)
+    heatmap_asset_id = db.Column(
+        db.String(36),
+        db.ForeignKey("assets.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    colorbar_asset_id = db.Column(
+        db.String(36),
+        db.ForeignKey("assets.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    map_snapshot_asset_id = db.Column(
+        db.String(36),
+        db.ForeignKey("assets.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    summary_asset_id = db.Column(
+        db.String(36),
+        db.ForeignKey("assets.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    project = db.relationship("Project", back_populates="coverages")
+    heatmap_asset = db.relationship("Asset", foreign_keys=[heatmap_asset_id])
+    colorbar_asset = db.relationship("Asset", foreign_keys=[colorbar_asset_id])
+    map_snapshot_asset = db.relationship("Asset", foreign_keys=[map_snapshot_asset_id])
+    summary_asset = db.relationship("Asset", foreign_keys=[summary_asset_id])
 
 
 class DatasetSource(TimestampMixin, db.Model):

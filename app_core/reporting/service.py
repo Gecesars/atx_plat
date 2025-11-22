@@ -4,7 +4,6 @@ import base64
 import io
 import textwrap
 from datetime import datetime
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 import math
 import json
@@ -15,11 +14,13 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen import canvas
 import matplotlib.pyplot as plt
+from PIL import Image, ImageDraw, ImageFont
 
 from extensions import db
 from app_core.models import Asset, AssetType, Project, Report
-from app_core.storage import ensure_project_path_exists, storage_root
-from .ai import build_ai_summary, AIUnavailable, AISummaryError
+from app_core.storage import inline_asset_path
+from app_core.storage_utils import rehydrate_asset_data
+from .ai import build_ai_summary, validate_ai_sections, AIUnavailable, AISummaryError
 from app_core.integrations import ibge as ibge_api
 from app_core.analytics.coverage_ibge import summarize_coverage_demographics
 
@@ -30,6 +31,47 @@ MAX_RECEIVER_ROWS = None
 MAX_POP_LOOKUPS = 5
 DEFAULT_HEADER_COLOR = "#0d47a1"
 GAIN_OFFSET_DBI_DBD = 2.15
+
+GLOSSARY_TERMS: list[tuple[str, str]] = [
+    (
+        "ERP (Effective Radiated Power)",
+        "Potência efetivamente irradiada considerando o ganho da antena e as perdas do sistema. "
+        "É a referência para comparar projetos e validar níveis de campo.",
+    ),
+    (
+        "HAAT / HMNT (Altura acima do terreno médio)",
+        "Diferença entre a altitude do centro de irradiação e a média do terreno entre 3 e 16 km em cada radial. "
+        "Indica o quão \"alto\" o sistema está em relação ao entorno.",
+    ),
+    (
+        "Zona de Fresnel",
+        "Volume elipsoidal em torno do enlace direto TX↔RX. Obstruções dentro da primeira zona impactam o nível de sinal.",
+    ),
+    (
+        "Perdas L_b (P.452)",
+        "Conjunto de perdas calculadas pelo ITU-R P.452 (difração, espalhamento, troposfera) usado para estimar o campo recebido.",
+    ),
+    (
+        "Tilt / Azimute",
+        "Tilt define a inclinação vertical do feixe; azimute define a direção horizontal de máxima irradiação.",
+    ),
+    (
+        "Polarização",
+        "Orientação do campo elétrico (vertical, horizontal ou circular) que deve ser mantida entre TX e RX para maximizar acoplamento.",
+    ),
+    (
+        "Contorno protegido",
+        "Limite geográfico onde o campo atinge o valor regulamentar (ex.: 66 dBµV/m FM). Delimita a área de proteção contra interferências.",
+    ),
+    (
+        "RT3D",
+        "Motor tridimensional que utiliza geometria urbana extrudada para estimar penalidades adicionais (sombras, múltiplos caminhos).",
+    ),
+    (
+        "IBGE Demográfico",
+        "Estimativas oficiais usadas para inferir o impacto populacional nas áreas cobertas acima do limiar definido.",
+    ),
+]
 
 CLIMATE_STATE_MAP = {
     "AC": "Equatorial úmido",
@@ -275,127 +317,90 @@ def _classify_station(service_label, frequency_mhz, erp_dbm, haat_m):
     }
 
 
+def _synthesize_radials(avg_haat_m, avg_terrain_m=None, bearing_step=15):
+    try:
+        haat_value = round(float(avg_haat_m), 2)
+    except (TypeError, ValueError):
+        return []
+    radials: list[dict[str, float]] = []
+    step = max(1, int(bearing_step))
+    for bearing in range(0, 360, step):
+        entry: dict[str, float] = {
+            'bearing_deg': float(bearing),
+            'haat_m': haat_value,
+        }
+        if avg_terrain_m is not None:
+            try:
+                entry['avg_terrain_m'] = round(float(avg_terrain_m), 2)
+            except (TypeError, ValueError):
+                pass
+        radials.append(entry)
+    return radials
+
 
 def _estimate_population_impact(
     snapshot: Dict[str, Any],
     allow_remote_lookup: bool = True,
+    receivers_preprocessed: list[Dict[str, Any]] | None = None,
 ) -> tuple[list[Dict[str, Any]], int]:
     """
-    Estima o impacto populacional filtrando os RX por LIMIAR em dBµV/m (campo elétrico).
-    - Usa os campos do RX: 'field_strength_dbuv_m' ou 'field' (strings como "63.3 dBµV/m" são aceitas).
-    - Deduplica por (municipality, state).
-    - Reaproveita snapshot['ibge_registry'][code] quando disponível.
-    - Chama ibge_api.fetch_demographics_by_city(city, state) apenas quando necessário.
-
-    Observações:
-    - Limiar padrão em dBµV/m pode ser passado no snapshot: snapshot['min_field_dbuv_m'].
-      Se não vier, usa 28.0 dBµV/m por padrão.
-    - Mantém o retorno original: (summary, total).
+    Estima o impacto populacional filtrando receptores acima do limiar em dBµV/m.
+    Quando `receivers_preprocessed` é fornecido, reutiliza os dados já enriquecidos
+    por `_collect_receiver_entries` para evitar inconsistências com projetos antigos.
     """
-    import re
-
-    def _coerce_float_dbuvm(value) -> float | None:
-        """Extrai float de entradas possivelmente com unidade, ex.: '63.3 dBµV/m', '55,2', 58.0."""
-        if value in (None, ""):
-            return None
-        try:
-            return float(str(value).replace(",", "."))
-        except (TypeError, ValueError):
-            pass
-        m = re.search(r"[-+]?\d+(?:[\.,]\d+)?", str(value))
-        if not m:
-            return None
-        try:
-            return float(m.group(0).replace(",", "."))
-        except (TypeError, ValueError):
-            return None
-
-    # 1) Parâmetros e coleções base
-    receivers = snapshot.get('receivers') or []
+    processed_receivers = receivers_preprocessed or _collect_receiver_entries(snapshot, limit=None)
     registry = snapshot.get('ibge_registry') or {}
 
-    # Limiar em dBµV/m (pode vir do snapshot; caso contrário, usa 28.0)
     try:
         field_threshold_dbuv_m = float(str(snapshot.get('min_field_dbuv_m', 28.0)).replace(",", "."))
     except (TypeError, ValueError):
         field_threshold_dbuv_m = 28.0
 
-    shortlisted: list[Dict[str, Any]] = []
-
-    # 2) Coleta e filtro por dBµV/m
-    for rx in receivers:
-        raw_field = rx.get('field_strength_dbuv_m')
-        if raw_field in (None, ""):
-            raw_field = rx.get('field')
-        field_val = _coerce_float_dbuvm(raw_field)
-        if field_val is None or field_val < field_threshold_dbuv_m:
-            continue
-
-        location = rx.get('location') or {}
-        municipality = (
-            rx.get('municipality')
-            or location.get('municipality')
-            or location.get('city')
-            or location.get('cidade')
-        )
-        state = (
-            rx.get('state')
-            or location.get('state')
-            or location.get('uf')
-            or location.get('estado')
-        )
-        if not municipality:
-            # sem município não dá para consultar IBGE
-            continue
-
-        ibge_info = rx.get('ibge') or {}
-        demographics = ibge_info.get('demographics')
-        if isinstance(demographics, dict) and demographics.get('total') is None:
-            demographics = None
-
-        shortlisted.append({
-            "label": rx.get('label') or rx.get('name') or f"RX {len(shortlisted) + 1}",
-            "municipality": municipality,
-            "state": state,
-            "distance_km": rx.get('distance_km') or rx.get('distance'),
-            "power_dbm": rx.get('power_dbm') or rx.get('power'),
-            "field_dbuv_m": field_val,  # já como float
-            "quality": rx.get('quality') or rx.get('status'),
-            "profile": rx.get('profile') or {},
-            "ibge_code": ibge_info.get('code') or ibge_info.get('ibge_code'),
-            "demographics": demographics,
-        })
-
-    # 3) Ordena por campo (desc) para priorizar melhor recepção
-    shortlisted.sort(key=lambda it: (it['field_dbuv_m'] if it['field_dbuv_m'] is not None else -1e9), reverse=True)
-
-    # 4) Deduplica por município/UF e consulta IBGE (com cache)
     summary: list[Dict[str, Any]] = []
     total = 0
     seen: set[tuple[str | None, str | None]] = set()
 
-    for entry in shortlisted:
-        city = entry.get('municipality')
-        state = entry.get('state')
-        key = (city, state)
+    for entry in processed_receivers:
+        field_val = entry.get('field_dbuv_m')
+        if field_val is None or field_val < field_threshold_dbuv_m:
+            continue
+
+        key = (entry.get('municipality'), entry.get('state'))
         if key in seen:
             continue
         seen.add(key)
 
         demographics = entry.get('demographics')
         code = entry.get('ibge_code')
-
-        if not demographics and code and registry.get(code):
-            demographics = registry.get(code)
+        if not demographics and code and registry.get(str(code)):
+            demographics = registry.get(str(code))
 
         if not demographics and allow_remote_lookup:
             try:
-                demographics = ibge_api.fetch_demographics_by_city(city, state)
+                demographics = ibge_api.fetch_demographics_by_city(entry.get('municipality'), entry.get('state'))
             except Exception:
                 demographics = None
 
-        population_value = (demographics or {}).get('total')
-        summary.append({**entry, 'population': population_value, 'demographics': demographics})
+        population_value = entry.get('population')
+        if population_value is None:
+            population_value = (demographics or {}).get('total')
+
+        population_year = entry.get('population_year')
+        if not population_year and isinstance(demographics, dict):
+            population_year = demographics.get('period')
+
+        summary_entry = {
+            "label": entry.get('label'),
+            "municipality": entry.get('municipality'),
+            "state": entry.get('state'),
+            "distance_km": entry.get('distance_km'),
+            "field_dbuv_m": entry.get('field_dbuv_m'),
+            "ibge_code": entry.get('ibge_code'),
+            "population": population_value,
+            "population_year": population_year,
+            "demographics": demographics,
+        }
+        summary.append(summary_entry)
         if isinstance(population_value, (int, float)):
             total += int(population_value)
 
@@ -431,19 +436,6 @@ def _draw_columns(c: canvas.Canvas, top_y: int, columns: list[tuple[int, list[tu
     for x, lines in columns:
         bottoms.append(_draw_text_block(c, x, top_y, lines))
     return min(bottoms) if bottoms else top_y
-
-
-def _embed_image(c: canvas.Canvas, image_path: Path, x: int, y: int, max_width: int, max_height: int):
-    try:
-        reader = ImageReader(str(image_path))
-        width, height = reader.getSize()
-        ratio = min(max_width / width, max_height / height)
-        c.drawImage(reader, x, y - height * ratio, width=width * ratio, height=height * ratio)
-        return y - height * ratio - 20
-    except Exception:
-        c.setFont('Helvetica-Oblique', 9)
-        c.drawString(x, y, 'Prévia da cobertura indisponível.')
-        return y - 14
 
 
 def _embed_binary_image(c: canvas.Canvas, blob: bytes | None, x: int, y: int, max_width: int, max_height: int) -> int:
@@ -508,13 +500,109 @@ def _render_receiver_profile_plot(receiver: Dict[str, Any]) -> bytes | None:
         step = total_distance_km / (n - 1)
         distances = [i * step for i in range(n)]
         xlabel = 'Distância (km)'
-    fig, ax = plt.subplots(figsize=(4.2, 2.2))
-    ax.plot(distances, elevations, color='#0d47a1', linewidth=1.5)
-    ax.fill_between(distances, elevations, color='#90caf9', alpha=0.3)
+    meta = receiver.get('profile_meta') or {}
+    tx_height = _safe_float(meta.get('tx_height_m')) or 0.0
+    rx_height = _safe_float(meta.get('rx_height_m')) or 0.0
+    tx_ground = elevations[0]
+    rx_ground = elevations[-1]
+    tx_total = (_safe_float(meta.get('tx_elevation_m')) or tx_ground) + tx_height
+    rx_total = (_safe_float(meta.get('rx_elevation_m')) or rx_ground) + rx_height
+
+    ground_profile = list(elevations)
+    los_heights: list[float] = []
+    freq_mhz = _safe_float(
+        meta.get('frequency_mhz')
+        or receiver.get('frequency_mhz')
+        or receiver.get('frequency')
+    ) or 100.0
+    freq_mhz = max(freq_mhz, 0.1)
+    wavelength_m = 300.0 / freq_mhz
+
+    k_factor = 4.0 / 3.0
+    effective_radius_m = 6_371_000.0 * k_factor
+    use_curvature = (
+        total_distance_km
+        and len(distances) == len(elevations)
+        and total_distance_km > 0.0
+        and tx_total is not None
+        and rx_total is not None
+    )
+    base_line = []
+    if use_curvature:
+        adjusted = []
+        los_curve = []
+        for idx, distance in enumerate(distances):
+            d_km = distance if total_distance_km else idx
+            d_m = d_km * 1000.0
+            drop = (d_m ** 2) / (2 * effective_radius_m)
+            adjusted.append(elevations[idx] - drop)
+            frac = (d_km / total_distance_km) if total_distance_km else 0.0
+            straight_height = tx_total + (rx_total - tx_total) * frac
+            los_curve.append(straight_height - drop)
+        ground_profile = adjusted
+        los_heights = los_curve
+        base_line = los_curve[:]
+    else:
+        if total_distance_km and tx_total is not None and rx_total is not None:
+            for distance in distances:
+                frac = (distance / total_distance_km) if total_distance_km else 0.0
+                base_line.append(tx_total + (rx_total - tx_total) * frac)
+
+    fig, ax = plt.subplots(figsize=(5.4, 3.0), dpi=180)
+    ax.set_facecolor('#f8fafc')
+    ax.plot(distances, ground_profile, color='#0d47a1', linewidth=1.8, label='Terreno ajustado')
+    ax.fill_between(distances, ground_profile, color='#90caf9', alpha=0.3)
+
+    fresnel_top = []
+    fresnel_bottom = []
+    if base_line and total_distance_km:
+        for idx, distance in enumerate(distances):
+            d1 = max(distance * 1000.0, 1e-6)
+            d2 = max((total_distance_km - distance) * 1000.0, 1e-6)
+            radius = math.sqrt((wavelength_m * d1 * d2) / (d1 + d2))
+            center_height = base_line[idx] if idx < len(base_line) else base_line[-1]
+            fresnel_top.append(center_height + radius)
+            fresnel_bottom.append(center_height - radius)
+        ax.fill_between(distances, fresnel_bottom, fresnel_top, color='#fde68a', alpha=0.25, label='1ª zona de Fresnel')
+
+    if los_heights:
+        ax.plot(distances, los_heights, linestyle='--', color='#f97316', linewidth=1.2, label='Linha de visada')
+
+    ax.scatter([distances[0]], [ground_profile[0]], marker='^', color='#1d4ed8', s=38, label='TX')
+    ax.scatter([distances[-1]], [ground_profile[-1]], marker='s', color='#d946ef', s=34, label='RX')
+    if ax.get_legend_handles_labels()[0]:
+        ax.legend(loc='upper right', fontsize=7, framealpha=0.82)
+
     ax.set_xlabel(xlabel, fontsize=8)
     ax.set_ylabel('Elevação (m)', fontsize=8)
     ax.grid(True, linestyle='--', alpha=0.25)
     ax.tick_params(labelsize=7)
+
+    annotation_lines: list[str] = []
+    field_value = _safe_float(
+        receiver.get('field_dbuv_m')
+        or (receiver.get('summary') or {}).get('field_dbuv_m')
+        or (receiver.get('summary') or {}).get('fieldValue')
+        or receiver.get('field')
+    )
+    if field_value is not None:
+        annotation_lines.append(f"Campo RX: {field_value:.1f} dBµV/m")
+    population_value = receiver.get('population') or ((receiver.get('demographics') or {}).get('total'))
+    if population_value:
+        annotation_lines.append(f"População: {_format_int(population_value)}")
+    if annotation_lines:
+        ax.text(
+            0.99,
+            0.05,
+            "\n".join(annotation_lines),
+            transform=ax.transAxes,
+            ha='right',
+            va='bottom',
+            fontsize=7,
+            color='#0f172a',
+            bbox=dict(boxstyle='round,pad=0.25', facecolor='white', alpha=0.85, edgecolor='#e2e8f0'),
+        )
+
     fig.tight_layout()
     buffer = io.BytesIO()
     fig.savefig(buffer, format='png', dpi=150)
@@ -524,24 +612,12 @@ def _render_receiver_profile_plot(receiver: Dict[str, Any]) -> bytes | None:
 
 
 def _load_profile_asset(receiver: Dict[str, Any]) -> bytes | None:
-    candidate_path = receiver.get('profile_asset_path')
-    if candidate_path:
-        path = storage_root() / candidate_path
-        if path.exists():
-            try:
-                return path.read_bytes()
-            except OSError:
-                pass
-    asset_id = receiver.get('profile_asset_id')
-    if asset_id:
-        asset = Asset.query.filter_by(id=asset_id).first()
-        if asset:
-            path = storage_root() / asset.path
-            if path.exists():
-                try:
-                    return path.read_bytes()
-                except OSError:
-                    pass
+    blob = _load_asset_blob(
+        receiver.get('profile_asset_id'),
+        receiver.get('profile_asset_path'),
+    )
+    if blob:
+        return blob
     inline = receiver.get('profile_image')
     if inline:
         try:
@@ -550,6 +626,193 @@ def _load_profile_asset(receiver: Dict[str, Any]) -> bytes | None:
         except Exception:
             return None
     return None
+
+
+def _profile_modal_font(size: int = 16, *, bold: bool = False):
+    font_candidates = [
+        "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    ]
+    for candidate in font_candidates:
+        try:
+            return ImageFont.truetype(candidate, size)
+        except (OSError, IOError):
+            continue
+    return ImageFont.load_default()
+
+
+def _font_line_height(font) -> int:
+    try:
+        bbox = font.getbbox("Ag")
+        return int((bbox[3] - bbox[1]) * 1.2)
+    except Exception:
+        return 18
+
+
+def _normalize_label(value: str | None) -> str:
+    return (value or "").strip().lower()
+
+
+def _compose_profile_modal_image(receiver: Dict[str, Any], *, user, snapshot: Dict[str, Any]) -> bytes | None:
+    base_blob = _load_profile_asset(receiver) or _render_receiver_profile_plot(receiver)
+    if not base_blob:
+        return None
+    try:
+        chart_image = Image.open(io.BytesIO(base_blob)).convert('RGBA')
+    except Exception:
+        return base_blob
+
+    width = max(1100, chart_image.width + 200)
+    header_height = 220
+    chart_max_width = width - 80
+    ratio = min(1.0, chart_max_width / float(chart_image.width or 1))
+    chart_height = int(chart_image.height * ratio)
+    info_lines = receiver.get('profile_info') or _profile_info_from_meta(receiver.get('profile_meta'))
+    info_block_height = max(120, 20 + len(info_lines or []) * 20)
+    canvas_height = header_height + chart_height + info_block_height + 80
+
+    canvas = Image.new('RGB', (width, canvas_height), (249, 250, 251))
+    draw = ImageDraw.Draw(canvas)
+    title_font = _profile_modal_font(26, bold=True)
+    section_font = _profile_modal_font(16, bold=True)
+    text_font = _profile_modal_font(16, bold=False)
+    small_font = _profile_modal_font(14)
+
+    def _safe_coord(value):
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    tx_location = snapshot.get('tx_location_name') or getattr(user, 'tx_location_name', None) or '—'
+    tx_altitude = snapshot.get('tx_site_elevation') or getattr(user, 'tx_site_elevation', None)
+    tower_height = getattr(user, 'tower_height', None)
+    tx_direction = getattr(user, 'antenna_direction', None)
+    tx_tilt = getattr(user, 'antenna_tilt', None)
+    location = receiver.get('location') or {}
+    rx_municipality = receiver.get('municipality') or location.get('municipality') or '—'
+    rx_state = receiver.get('state') or location.get('state') or '—'
+    rx_altitude = receiver.get('altitude_m') or location.get('altitude')
+    rx_field = _receiver_field_dbuv(receiver)
+    rx_lat = location.get('lat') or receiver.get('lat')
+    rx_lng = location.get('lng') or location.get('lon') or receiver.get('lng')
+    profile_meta = receiver.get('profile_meta') or {}
+    distance_val = profile_meta.get('distance_km') or receiver.get('distance_km') or receiver.get('distance')
+    erp_val = profile_meta.get('erp_dbm')
+    rx_power_val = profile_meta.get('rx_power_dbm') or _receiver_power_dbm(receiver)
+    observations = []
+    if profile_meta.get('obstacles'):
+        observations.append(str(profile_meta['obstacles']))
+    if info_lines:
+        observations.extend(info_lines)
+    if not observations:
+        observations = ["Sem observações adicionais registradas para este enlace."]
+
+    tx_lines = [
+        ("Município", tx_location),
+        ("Altitude do sítio", _format_number(tx_altitude, 'm')),
+        ("Altura da torre", _format_number(tower_height, 'm')),
+        ("Azimute/Tilt", f"{_format_number(tx_direction, '°')} / {_format_number(tx_tilt, '°')}"),
+    ]
+    rx_field_text = f"{rx_field:.1f} dBµV/m" if isinstance(rx_field, (int, float)) else "—"
+    rx_lines = [
+        ("Município/UF", f"{rx_municipality} / {rx_state}"),
+        ("Altitude", _format_number(rx_altitude, 'm')),
+        ("Campo estimado", rx_field_text),
+        ("Coordenadas", f"{_safe_coord(rx_lat)}, {_safe_coord(rx_lng)}"),
+    ]
+    link_lines = [
+        ("Distância", _format_number(distance_val, 'km')),
+        ("ERP na direção", _format_number(erp_val, 'dBm')),
+        ("Potência RX", _format_number(rx_power_val, 'dBm')),
+        ("Qualidade", receiver.get('quality') or '—'),
+    ]
+
+    columns = [
+        ("Transmissor", tx_lines),
+        ("Receptor", rx_lines),
+        ("Link", link_lines),
+    ]
+    col_width = (width - 80) // len(columns)
+    x_cursor = 40
+    draw.text((40, 20), "Perfil de enlace", font=title_font, fill=(15, 23, 42))
+    for title, lines in columns:
+        draw.text((x_cursor, 70), title, font=section_font, fill=(31, 41, 55))
+        y_cursor = 100
+        for label, value in lines:
+            text = f"{label}: {value}"
+            wrapped = textwrap.wrap(text, width=max(20, int(col_width / 9)))
+            for wrapped_line in wrapped:
+                draw.text((x_cursor, y_cursor), wrapped_line, font=text_font, fill=(55, 65, 81))
+                y_cursor += _font_line_height(text_font)
+        x_cursor += col_width
+
+    chart_position_y = header_height
+    try:
+        resized_chart = chart_image.resize((int(chart_image.width * ratio), max(1, chart_height)), Image.LANCZOS)
+    except Exception:
+        resized_chart = chart_image.copy()
+    chart_x = (width - resized_chart.width) // 2
+    canvas.paste(resized_chart, (chart_x, chart_position_y), resized_chart if resized_chart.mode == 'RGBA' else None)
+
+    obs_y = chart_position_y + resized_chart.height + 20
+    draw.text((40, obs_y), "Observações", font=section_font, fill=(31, 41, 55))
+    obs_y += 28
+    for line in observations:
+        wrapped = textwrap.wrap(str(line), width=110)
+        for wrapped_line in wrapped:
+            draw.text((40, obs_y), wrapped_line, font=small_font, fill=(55, 65, 81))
+            obs_y += _font_line_height(small_font)
+
+    output = io.BytesIO()
+    canvas.save(output, format='PNG', optimize=True)
+    chart_image.close()
+    resized_chart.close()
+    return output.getvalue()
+
+
+def _profile_modal_images(
+    receivers: list[Dict[str, Any]],
+    preferred_payload: list[Dict[str, Any]],
+    user,
+    snapshot: Dict[str, Any],
+    limit: int = 2,
+) -> Dict[str, bytes]:
+    if not receivers or limit <= 0:
+        return {}
+    lookup: dict[str, Dict[str, Any]] = {}
+    for rx in receivers:
+        label = rx.get('label') or rx.get('name')
+        norm = _normalize_label(label)
+        if norm and norm not in lookup:
+            lookup[norm] = rx
+    ordered: list[tuple[Dict[str, Any], str]] = []
+    seen: set[str] = set()
+    for payload_entry in preferred_payload or []:
+        label = payload_entry.get('label')
+        norm = _normalize_label(label)
+        if norm and norm in lookup and norm not in seen:
+            ordered.append((lookup[norm], label or lookup[norm].get('label')))
+            seen.add(norm)
+        if len(ordered) >= limit:
+            break
+    if len(ordered) < limit:
+        for rx in receivers:
+            norm = _normalize_label(rx.get('label') or rx.get('name'))
+            if not norm or norm in seen:
+                continue
+            ordered.append((rx, rx.get('label') or rx.get('name') or f"RX {len(ordered) + 1}"))
+            seen.add(norm)
+            if len(ordered) >= limit:
+                break
+    results: dict[str, bytes] = {}
+    for rx, label in ordered:
+        blob = _compose_profile_modal_image(rx, user=user, snapshot=snapshot)
+        if blob:
+            results[label or f"RX {len(results) + 1}"] = blob
+        if len(results) >= limit:
+            break
+    return results
 
 
 def _profile_info_from_meta(meta: Dict[str, Any] | None) -> list[str]:
@@ -680,51 +943,36 @@ def _dominant_category(counts: dict[str, int] | None) -> tuple[str | None, float
     return best_name, percent
 
 
+def _load_asset_blob(asset_id: str | None = None, fallback_path: str | None = None) -> bytes | None:
+    asset = None
+    if asset_id:
+        asset = Asset.query.filter_by(id=asset_id).first()
+    elif fallback_path:
+        if str(fallback_path).startswith('inline://'):
+            asset = Asset.query.filter_by(path=fallback_path).first()
+        else:
+            asset = Asset.query.filter_by(path=fallback_path).first()
+    if asset:
+        if asset.data:
+            return bytes(asset.data)
+        payload = rehydrate_asset_data(asset)
+        if payload:
+            return payload
+    return None
+
+
 def _read_storage_blob(relative_path: str | None) -> bytes | None:
-    if not relative_path:
-        return None
-    candidate = Path(relative_path)
-    if not candidate.is_absolute():
-        candidate = storage_root() / candidate
-    try:
-        if candidate.exists():
-            return candidate.read_bytes()
-    except OSError:
-        return None
-    return None
-
-
-def _asset_path(asset_id: str | None) -> Path | None:
-    if not asset_id:
-        return None
-    asset = Asset.query.filter_by(id=asset_id).first()
-    if asset is None:
-        return None
-    return storage_root() / asset.path
-
-
-def _coverage_summary_path(snapshot: Dict[str, Any]) -> Path | None:
-    json_asset_id = snapshot.get('json_asset_id')
-    path = _asset_path(json_asset_id)
-    if path and path.exists():
-        return path
-
-    asset_rel = snapshot.get('asset_path')
-    if asset_rel:
-        candidate = storage_root() / asset_rel
-        if candidate.exists():
-            summary_candidate = candidate.with_name(candidate.name.replace('_field.png', '_summary.json'))
-            if summary_candidate.exists():
-                return summary_candidate
-    return None
+    return _load_asset_blob(fallback_path=relative_path)
 
 
 def _load_coverage_ibge(snapshot: Dict[str, Any], threshold_dbuv: float = 25.0) -> Optional[Dict[str, Any]]:
-    summary_path = _coverage_summary_path(snapshot)
-    if not summary_path:
+    if not snapshot:
         return None
     try:
-        return summarize_coverage_demographics(summary_path, min_field_dbuvm=threshold_dbuv)
+        return summarize_coverage_demographics(
+            summary_payload=snapshot,
+            min_field_dbuvm=threshold_dbuv,
+        )
     except Exception as exc:  # pragma: no cover - proteção adicional
         current_app.logger.warning('reporting.coverage_ibge_failed', extra={'error': str(exc)})
         return None
@@ -762,6 +1010,13 @@ def _build_metrics(project: Project, snapshot: Dict[str, Any], center_metrics: D
         erp_dbm = tx_power_dbm + (gain_dbi or 0.0) - (loss_db or 0.0)
     climate_text = _infer_climate_descriptor(project, snapshot) or "Clima não informado"
     haat_average = snapshot.get('haat_average_m')
+    if haat_average is None:
+        fallback_haat = _safe_float(
+            (snapshot.get('tx_parameters') or {}).get('tower_height_m')
+            or (settings.get('towerHeight') or settings.get('tower_height'))
+            or getattr(user, 'tower_height', None)
+        )
+        haat_average = fallback_haat
     return {
         "service": settings.get("serviceType") or getattr(user, "servico", "Radiodifusão"),
         "service_class": settings.get("serviceClass") or settings.get("classe") or "—",
@@ -804,6 +1059,43 @@ def _receiver_field_dbuv(receiver: Dict[str, Any]) -> float | None:
     return None
 
 
+def _clean_city_label(value) -> str | None:
+    if not value:
+        return None
+    parts = [segment.strip() for segment in str(value).split(",")]
+    for part in parts:
+        if part:
+            return part
+    return None
+
+
+def _receiver_location_hints(municipality_label, state_label, location) -> tuple[str | None, str | None]:
+    location = location or {}
+    city = None
+    for candidate in (
+        location.get("municipality"),
+        location.get("city"),
+        location.get("name"),
+        municipality_label,
+    ):
+        city = _clean_city_label(candidate)
+        if city:
+            break
+
+    state = None
+    for candidate in (
+        location.get("state_code"),
+        location.get("state"),
+        state_label,
+    ):
+        if candidate:
+            state = str(candidate).strip()
+            if state:
+                break
+    normalized_state = ibge_api.normalize_state_code(state) if state else None
+    return city, normalized_state or state
+
+
 def _collect_receiver_entries(snapshot: Dict[str, Any], limit: int | None = MAX_RECEIVER_ROWS) -> list[Dict[str, Any]]:
     receivers = snapshot.get('receivers') or []
     entries: list[Dict[str, Any]] = []
@@ -824,6 +1116,34 @@ def _collect_receiver_entries(snapshot: Dict[str, Any], limit: int | None = MAX_
             demographics = None
         profile_meta = rx.get('profile_meta') or {}
         profile_info = rx.get('profile_info') or rx.get('profile_info_lines')
+        city_hint, state_hint = _receiver_location_hints(municipality, state, location)
+        resolved_ibge_code = ibge_info.get('code') or ibge_info.get('ibge_code')
+        if city_hint:
+            target_code = ibge_api.resolve_municipality_code(city_hint, state_hint)
+        else:
+            target_code = resolved_ibge_code
+        target_code = str(target_code) if target_code else None
+
+        refreshed_demographics = demographics
+        if target_code and (not demographics or str(demographics.get('code')) != target_code):
+            fetched = ibge_api.fetch_demographics_by_code(target_code)
+            if fetched:
+                refreshed_demographics = fetched
+                resolved_ibge_code = target_code
+
+        if (not refreshed_demographics) and city_hint:
+            fetched = ibge_api.fetch_demographics_by_city(city_hint, state_hint)
+            if fetched:
+                refreshed_demographics = fetched
+                resolved_ibge_code = fetched.get('code') or resolved_ibge_code
+
+        population_value = (refreshed_demographics or {}).get('total')
+        population_year = None
+        if isinstance(refreshed_demographics, dict) and refreshed_demographics.get('period'):
+            population_year = refreshed_demographics['period']
+        elif snapshot.get('population_year'):
+            population_year = snapshot.get('population_year')
+
         entries.append({
             "label": rx.get('label') or rx.get('name') or f"RX {len(entries) + 1}",
             "municipality": municipality,
@@ -834,8 +1154,11 @@ def _collect_receiver_entries(snapshot: Dict[str, Any], limit: int | None = MAX_
             "altitude_m": rx.get('altitude_m') or location.get('altitude'),
             "quality": rx.get('quality') or rx.get('status'),
             "meets_field_min": field is not None and field >= MIN_FIELD_DBUV,
-            "demographics": demographics,
-            "ibge_code": ibge_info.get('code') or ibge_info.get('ibge_code'),
+            "demographics": refreshed_demographics,
+            "ibge_code": resolved_ibge_code,
+            "population": population_value,
+            "population_year": population_year,
+            "erp_dbm": profile_meta.get('erp_dbm'),
             "profile": rx.get('profile') or {},
             "profile_meta": profile_meta,
             "profile_info": profile_info,
@@ -983,11 +1306,18 @@ def build_analysis_preview(project: Project, *, allow_ibge: bool = True) -> Dict
     metrics['link_summary'] = link_summary_text
     metrics['coverage_ibge'] = coverage_ibge
 
+    profile_modal_images = _profile_modal_images(receivers_full, link_payload[:2], user, snapshot, limit=2)
+    fallback_profile_blob = getattr(user, "perfil_img", None)
+    if not fallback_profile_blob and receivers_full:
+        fallback_profile_blob = _render_receiver_profile_plot(receivers_full[0])
+    primary_profile_blob = next(iter(profile_modal_images.values()), None) or fallback_profile_blob
     saved_horizontal = _decode_inline_image(snapshot.get('diagram_horizontal_b64'))
     saved_vertical = _decode_inline_image(snapshot.get('diagram_vertical_b64'))
+    coverage_overlay_blob = _read_storage_blob(snapshot.get('asset_path'))
+    coverage_snapshot_blob = _read_storage_blob(snapshot.get('map_snapshot_path'))
     diagram_images = {
-        "mancha_de_cobertura": _read_storage_blob(snapshot.get('asset_path')),
-        "perfil": getattr(user, "perfil_img", None),
+        "mancha_de_cobertura": coverage_overlay_blob or coverage_snapshot_blob,
+        "perfil": primary_profile_blob,
         "diagrama_horizontal": saved_horizontal or getattr(user, "antenna_pattern_img_dia_H", None),
         "diagrama_vertical": saved_vertical or getattr(user, "antenna_pattern_img_dia_V", None),
     }
@@ -997,8 +1327,11 @@ def build_analysis_preview(project: Project, *, allow_ibge: bool = True) -> Dict
     limited_summary_text = "\n".join(summary_lines[:len(limited_payload)]) if limited_payload else "Nenhum receptor selecionado."
     ai_metrics = dict(metrics)
     ai_metrics['link_summary'] = limited_summary_text
+    ai_images = dict(diagram_images)
+    for modal_label, modal_blob in profile_modal_images.items():
+        ai_images[f"perfil_modal::{modal_label}"] = modal_blob
     try:
-        ai_sections = build_ai_summary(project, snapshot, ai_metrics, diagram_images, links_payload=limited_payload)
+        ai_sections = build_ai_summary(project, snapshot, ai_metrics, ai_images, links_payload=limited_payload)
     except (AIUnavailable, AISummaryError) as exc:
         raise AnalysisReportError(str(exc)) from exc
 
@@ -1006,8 +1339,14 @@ def build_analysis_preview(project: Project, *, allow_ibge: bool = True) -> Dict
     population_details, population_total = _estimate_population_impact(
         snapshot,
         allow_remote_lookup=allow_ibge,
+        receivers_preprocessed=receiver_entries,
     )
     haat_radials = snapshot.get('haat_radials') or []
+    if not haat_radials:
+        terrain_hint = snapshot.get('tx_site_elevation') or getattr(user, 'tx_site_elevation', None)
+        synthetic_radials = _synthesize_radials(metrics.get('haat_average_m'), terrain_hint)
+        if synthetic_radials:
+            haat_radials = synthetic_radials
     classification = _classify_station(
         metrics.get('service'),
         metrics.get('frequency_mhz'),
@@ -1023,6 +1362,7 @@ def build_analysis_preview(project: Project, *, allow_ibge: bool = True) -> Dict
 
     heatmap_url = None
     colorbar_url = None
+    map_snapshot_url = None
     if snapshot.get('asset_id'):
         asset = Asset.query.filter_by(id=snapshot.get('asset_id')).first()
         if asset:
@@ -1031,6 +1371,10 @@ def build_analysis_preview(project: Project, *, allow_ibge: bool = True) -> Dict
         asset = Asset.query.filter_by(id=snapshot.get('colorbar_asset_id')).first()
         if asset:
             colorbar_url = url_for('projects.asset_preview', slug=project.slug, asset_id=asset.id)
+    if snapshot.get('map_snapshot_asset_id'):
+        asset = Asset.query.filter_by(id=snapshot.get('map_snapshot_asset_id')).first()
+        if asset:
+            map_snapshot_url = url_for('projects.asset_preview', slug=project.slug, asset_id=asset.id)
 
     return {
         'project': {
@@ -1042,6 +1386,7 @@ def build_analysis_preview(project: Project, *, allow_ibge: bool = True) -> Dict
             'generated_at': snapshot.get('generated_at'),
             'heatmap_url': heatmap_url,
             'colorbar_url': colorbar_url,
+            'map_snapshot_url': map_snapshot_url,
         },
         'metrics': metrics,
         'ai_sections': ai_sections,
@@ -1136,24 +1481,30 @@ def generate_analysis_report(
     link_summary_text, link_payload = _build_link_summary(receivers_full)
     metrics['link_summary'] = link_summary_text
 
-    coverage_rel_path = snapshot.get('asset_path')
-    coverage_image_path: Path | None = None
-    if coverage_rel_path:
-        candidate = Path(coverage_rel_path)
-        if not candidate.is_absolute():
-            candidate = storage_root() / candidate
-        if candidate.exists():
-            coverage_image_path = candidate
+    overlay_rel_path = snapshot.get('asset_path')
+    snapshot_rel_path = snapshot.get('map_snapshot_path')
+    coverage_overlay_blob = _read_storage_blob(overlay_rel_path)
+    coverage_snapshot_blob = _read_storage_blob(snapshot_rel_path)
 
+    profile_modal_images = _profile_modal_images(receivers_full, link_payload[:2], user, snapshot, limit=2)
+    fallback_profile_blob = getattr(user, "perfil_img", None)
+    if not fallback_profile_blob and receivers_full:
+        fallback_profile_blob = _render_receiver_profile_plot(receivers_full[0])
+    primary_profile_blob = next(iter(profile_modal_images.values()), None) or fallback_profile_blob
     saved_horizontal = _decode_inline_image(snapshot.get('diagram_horizontal_b64'))
     saved_vertical = _decode_inline_image(snapshot.get('diagram_vertical_b64'))
     diagram_images = {
-        "mancha_de_cobertura": _read_storage_blob(coverage_rel_path),
-        "perfil": getattr(user, "perfil_img", None),
+        "mancha_de_cobertura": coverage_overlay_blob or coverage_snapshot_blob,
+        "perfil": primary_profile_blob,
         "diagrama_horizontal": saved_horizontal or getattr(user, "antenna_pattern_img_dia_H", None),
         "diagrama_vertical": saved_vertical or getattr(user, "antenna_pattern_img_dia_V", None),
     }
     haat_radials = snapshot.get('haat_radials') or []
+    if not haat_radials:
+        terrain_hint = snapshot.get('tx_site_elevation') or getattr(user, 'tx_site_elevation', None)
+        synthetic_radials = _synthesize_radials(metrics.get('haat_average_m'), terrain_hint)
+        if synthetic_radials:
+            haat_radials = synthetic_radials
     classification = _classify_station(
         metrics.get('service'),
         metrics.get('frequency_mhz'),
@@ -1174,8 +1525,11 @@ def generate_analysis_report(
         limited_summary_text = "\n".join(summary_lines[:len(limited_payload)]) if limited_payload else "Nenhum receptor selecionado."
         ai_metrics = dict(metrics)
         ai_metrics['link_summary'] = limited_summary_text
+        ai_images = dict(diagram_images)
+        for modal_label, modal_blob in profile_modal_images.items():
+            ai_images[f"perfil_modal::{modal_label}"] = modal_blob
         try:
-            ai_sections = build_ai_summary(project, snapshot, ai_metrics, diagram_images, links_payload=limited_payload)
+            ai_sections = build_ai_summary(project, snapshot, ai_metrics, ai_images, links_payload=limited_payload)
         except (AIUnavailable, AISummaryError) as exc:
             raise AnalysisReportError(str(exc)) from exc
 
@@ -1197,23 +1551,29 @@ def generate_analysis_report(
     population_details, population_total = _estimate_population_impact(
         snapshot,
         allow_remote_lookup=allow_ibge,
+        receivers_preprocessed=receiver_entries,
     )
-    population_lookup = {
-        (row.get('municipality'), row.get('state')): row.get('demographics')
-        for row in population_details
-        if row.get('demographics')
-    }
+    population_lookup: dict[tuple[str | None, str | None], dict[str, Any]] = {}
+    for entry in receiver_entries:
+        key = (entry.get('municipality'), entry.get('state'))
+        demographics = entry.get('demographics')
+        if key not in population_lookup and demographics:
+            population_lookup[key] = demographics
+    for row in population_details:
+        key = (row.get('municipality'), row.get('state'))
+        demographics = row.get('demographics')
+        if demographics and key not in population_lookup:
+            population_lookup[key] = demographics
     coverage_ibge = _load_coverage_ibge(snapshot) if allow_ibge else None
 
     header_color = overrides.get('header_color') or DEFAULT_HEADER_COLOR
     company_logo_blob = _project_company_logo(project)
 
-    storage_dir = ensure_project_path_exists(project, 'assets', 'reports')
     timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
     filename = f"analysis_{project.slug}_{timestamp}.pdf"
-    pdf_path = storage_dir / filename
 
-    c = canvas.Canvas(str(pdf_path), pagesize=A4)
+    pdf_buffer = io.BytesIO()
+    c = canvas.Canvas(pdf_buffer, pagesize=A4)
     width, height = A4
 
     y = _start_page(
@@ -1323,12 +1683,35 @@ def generate_analysis_report(
     c.setFont('Helvetica-Bold', 11)
     c.drawString(40, y, "Mancha de cobertura")
     map_y = y - 20
-    colorbar_path = _asset_path(snapshot.get('colorbar_asset_id'))
     max_map_width = int(width - 80)
-    if colorbar_path and Path(colorbar_path).exists():
-        map_y = _embed_image(c, Path(colorbar_path), 40, map_y, max_width=max_map_width, max_height=50)
-    if coverage_image_path:
-        map_y = _embed_image(c, coverage_image_path, 40, map_y - 6, max_width=max_map_width, max_height=360)
+    colorbar_blob = _load_asset_blob(snapshot.get('colorbar_asset_id'), snapshot.get('colorbar_asset_path'))
+    if colorbar_blob:
+        map_y = _embed_binary_image(
+            c,
+            colorbar_blob,
+            40,
+            map_y,
+            max_width=max_map_width,
+            max_height=50,
+        )
+    if coverage_snapshot_blob:
+        map_y = _embed_binary_image(
+            c,
+            coverage_snapshot_blob,
+            40,
+            map_y - 6,
+            max_width=max_map_width,
+            max_height=360,
+        )
+    elif coverage_overlay_blob:
+        map_y = _embed_binary_image(
+            c,
+            coverage_overlay_blob,
+            40,
+            map_y - 6,
+            max_width=max_map_width,
+            max_height=360,
+        )
     else:
         c.setFont('Helvetica-Oblique', 9)
         c.drawString(40, map_y, 'Prévia da cobertura não localizada.')
@@ -1404,17 +1787,17 @@ def generate_analysis_report(
             company_logo=company_logo_blob,
         )
         c.setFont('Helvetica-Bold', 11)
-        c.drawString(40, y, "Altura média por radial (3–16 km)")
+        c.drawString(40, y, "Altura média por radial (HMNT 3–16 km)")
         y -= 18
         haat_columns = [
             ("Azimute", 80),
-            ("HAAT", 80),
+            ("HMNT", 80),
             ("Terreno médio", 110),
         ]
         haat_rows = [
             [
                 f"{int(item.get('bearing_deg', 0))}°",
-                _format_number(item.get('haat_m'), 'm'),
+                _format_number(item.get('hmnt_m') or item.get('haat_m'), 'm'),
                 _format_number(item.get('avg_terrain_m'), 'm'),
             ]
             for item in haat_radials
@@ -1447,8 +1830,7 @@ def generate_analysis_report(
 
     c.setFont('Helvetica-Bold', 11)
     c.drawString(40, y, "Perfil do enlace principal")
-    profile_blob = getattr(user, "perfil_img", None)
-    y = _embed_binary_image(c, profile_blob, 40, y - 6, max_width=int(width - 120), max_height=220)
+    y = _embed_binary_image(c, primary_profile_blob, 40, y - 6, max_width=int(width - 70), max_height=280)
     profile_text = ai_sections.get("profile") or "Sem observações adicionais registradas para o perfil."
     c.setFont('Helvetica', 10)
     y = _wrap_text(c, profile_text, 40, y, width_chars=95)
@@ -1478,23 +1860,27 @@ def generate_analysis_report(
         state = entry.get('state') or '—'
         distance_text = _format_number(entry.get('distance_km'), 'km')
         field_text = _format_number(entry.get('field_dbuv_m'), 'dBµV/m')
-        power_text = _format_number(entry.get('power_dbm'), 'dBm')
+        erp_text = _format_number(entry.get('erp_dbm'), 'dBm')
         altitude_text = _format_number(entry.get('altitude_m'), 'm')
         quality_text = entry.get('quality') or '—'
         compliance = "Atende (>=25 dBµV/m)" if entry.get('meets_field_min') else "Abaixo de 25 dBµV/m"
+        key = (entry.get('municipality'), entry.get('state'))
+        demo = entry.get('demographics') or population_lookup.get(key) or {}
+        population_value = entry.get('population') or (demo or {}).get('total')
+        population_year = entry.get('population_year') or (demo or {}).get('period')
+        population_text = _format_int(population_value)
         info_lines = [
             ("Município/UF", f"{municipality} / {state}"),
             ("Distância", distance_text),
             ("Campo", field_text),
-            ("Potência", power_text),
+            ("ERP na direção", erp_text),
             ("Altitude RX", altitude_text),
+            ("População (IBGE)", f"{population_text} {f'({population_year})' if population_year else ''}".strip()),
             ("Conformidade", compliance),
             ("Qualidade", quality_text),
         ]
         y = _draw_text_block(c, 50, y, info_lines)
-        key = (entry.get('municipality'), entry.get('state'))
-        demo = population_lookup.get(key) or {}
-        pop_value = demo.get('total')
+        pop_value = population_value
         sex_dom = _dominant_category(demo.get('sex') or {})
         age_dom = _dominant_category(demo.get('age') or {})
         demography_text = ""
@@ -1618,116 +2004,46 @@ def generate_analysis_report(
         )
         y -= 6
 
-    link_analysis_map = {}
+    link_analyses = []
     for item in ai_sections.get("link_analyses") or []:
-        if not isinstance(item, dict):
-            continue
-        label_key = (item.get('label') or '').strip()
-        analysis_text = item.get('analysis')
-        if label_key and analysis_text:
-            link_analysis_map[label_key.lower()] = str(analysis_text)
+        if isinstance(item, dict) and item.get('label') and item.get('analysis'):
+            link_analyses.append({"label": str(item['label']), "analysis": str(item['analysis'])})
 
-    if receivers_full:
-        section_title = "Perfis por receptor"
+    if link_analyses:
         y = _ensure_space(
             c,
             y,
-            220,
+            200,
             width,
             height,
-            section_title,
+            "Observações automáticas por receptor",
             project.slug,
             header_color,
             company_logo=company_logo_blob,
         )
         c.setFont('Helvetica-Bold', 11)
-        c.drawString(40, y, section_title)
+        c.drawString(40, y, "Observações automáticas por receptor")
         y -= 18
-        for idx, rx in enumerate(receivers_full, 1):
-            if y < 200:
+        for entry in link_analyses:
+            if y < 140:
                 c.showPage()
                 y = _start_page(
                     c,
                     width,
                     height,
-                    f"{section_title} (cont.)",
+                    "Observações automáticas por receptor (cont.)",
                     project.slug,
                     header_color,
                     company_logo=company_logo_blob,
                 )
                 c.setFont('Helvetica-Bold', 11)
-                c.drawString(40, y, f"{section_title} (cont.)")
+                c.drawString(40, y, "Observações automáticas por receptor (cont.)")
                 y -= 18
-            label = rx.get('label') or rx.get('name') or f"Receptor {idx}"
             c.setFont('Helvetica-Bold', 10)
-            c.drawString(40, y, label)
-            y -= 12
-            location = rx.get('location') or {}
-            municipality = rx.get('municipality') or location.get('municipality') or '—'
-            state = rx.get('state') or location.get('state') or '—'
-            lat = location.get('lat') or rx.get('lat')
-            lon = location.get('lng') or location.get('lon') or rx.get('lng')
-            try:
-                coord_text = f"{float(lat):.4f}, {float(lon):.4f}"
-            except (TypeError, ValueError):
-                coord_text = "—"
-            field_value = (
-                rx.get('field_strength_dbuv_m')
-                or rx.get('field')
-                or entry.get('field_dbuv_m')
-            )
-            power_value = rx.get('power_dbm') or rx.get('power')
-            distance_value = rx.get('distance_km') or rx.get('distance')
-            altitude_value = rx.get('altitude_m') or location.get('altitude')
-            quality_value = rx.get('quality') or rx.get('status') or '—'
-            meets_field_min = entry.get('meets_field_min')
-            field_compliance = "Atende (>=25 dBµV/m)" if meets_field_min else "Abaixo de 25 dBµV/m"
-            info_lines = [
-                ('Município/UF', f"{municipality} / {state}"),
-                ('Coordenadas', coord_text),
-                ('Campo', _format_number(field_value, 'dBµV/m')),
-                ('Potência', _format_number(power_value, 'dBm')),
-                ('Distância', _format_number(distance_value, 'km')),
-                ('Altitude RX', _format_number(altitude_value, 'm')),
-                ('Conformidade 25 dBµV/m', field_compliance),
-                ('Qualidade', quality_value),
-            ]
-            y = _draw_text_block(c, 50, y, info_lines)
-            analysis_text = None
-            key_lower = label.lower()
-            if key_lower in link_analysis_map:
-                analysis_text = link_analysis_map[key_lower]
-            else:
-                for key, text_val in link_analysis_map.items():
-                    if key in key_lower:
-                        analysis_text = text_val
-                        break
-            if analysis_text:
-                c.setFont('Helvetica-Oblique', 9)
-                y = _wrap_text(c, f"Observação automática: {analysis_text}", 50, y, width_chars=95, line_height=12)
-                y -= 4
-            else:
-                c.setFont('Helvetica-Oblique', 9)
-                y = _wrap_text(
-                    c,
-                    "Observação automática indisponível; utilize os níveis de campo acima como referência.",
-                    50,
-                    y,
-                    width_chars=95,
-                    line_height=12,
-                )
-                y -= 4
-            profile_blob = _render_receiver_profile_plot(rx)
-            if profile_blob:
-                y = _embed_binary_image(c, profile_blob, 50, y - 4, max_width=int(width - 120), max_height=160)
-            profile_info_lines = rx.get('profile_info') or _profile_info_from_meta(rx.get('profile_meta'))
-            if profile_info_lines:
-                c.setFont('Helvetica', 9)
-                for line in profile_info_lines:
-                    y -= 12
-                    c.drawString(50, y, line)
-                y -= 4
-            y -= 8
+            c.drawString(40, y, entry.get('label') or 'Receptor')
+            c.setFont('Helvetica', 9)
+            y = _wrap_text(c, entry.get('analysis') or "Sem observações adicionais.", 40, y - 14, width_chars=95, line_height=13)
+            y -= 6
 
     y = _ensure_space(
         c,
@@ -1804,17 +2120,55 @@ def generate_analysis_report(
             y = _wrap_text(c, f"- {rec}", 40, y, width_chars=95)
             y -= 4
 
+    y = _ensure_space(
+        c,
+        y,
+        260,
+        width,
+        height,
+        "Glossário técnico",
+        project.slug,
+        header_color,
+        company_logo=company_logo_blob,
+    )
+    c.setFont('Helvetica-Bold', 11)
+    c.drawString(40, y, "Glossário técnico")
+    y -= 18
+    for term, description in GLOSSARY_TERMS:
+        if y < 120:
+            c.showPage()
+            y = _start_page(
+                c,
+                width,
+                height,
+                "Glossário técnico (cont.)",
+                project.slug,
+                header_color,
+                company_logo=company_logo_blob,
+            )
+            c.setFont('Helvetica-Bold', 11)
+            c.drawString(40, y, "Glossário técnico (cont.)")
+            y -= 18
+        c.setFont('Helvetica-Bold', 10)
+        c.drawString(40, y, term)
+        c.setFont('Helvetica', 9)
+        y = _wrap_text(c, description, 40, y - 12, width_chars=95, line_height=13)
+        y -= 4
+
     c.setFont('Helvetica-Oblique', 8)
     c.drawString(40, 40, "Documento interno ATX Coverage")
 
     c.save()
+    pdf_buffer.seek(0)
+    pdf_blob = pdf_buffer.read()
 
-    relative_path = pdf_path.relative_to(storage_root())
     asset = Asset(
         project_id=project.id,
         type=AssetType.pdf,
-        path=str(relative_path),
+        path=inline_asset_path('reports', 'pdf'),
         mime_type='application/pdf',
+        byte_size=len(pdf_blob),
+        data=pdf_blob,
         meta={'kind': 'analysis', 'snapshot_asset': snapshot.get('asset_id')},
     )
     db.session.add(asset)
@@ -1831,3 +2185,28 @@ def generate_analysis_report(
     db.session.add(report_entry)
     db.session.commit()
     return report_entry
+
+
+def analyze_ai_inconsistencies(project: Project, ai_sections: Dict[str, Any]) -> List[Dict[str, Any]]:
+    snapshot = _latest_snapshot(project)
+    center_metrics = snapshot.get('center_metrics') or {}
+    metrics = _build_metrics(project, snapshot, center_metrics)
+    receivers = snapshot.get('receivers') or []
+    link_summary, link_payload = _build_link_summary(receivers)
+    normalized_sections = {
+        "overview": ai_sections.get("overview") or "",
+        "coverage": ai_sections.get("coverage") or "",
+        "profile": ai_sections.get("profile") or "",
+        "pattern_horizontal": ai_sections.get("pattern_horizontal") or "",
+        "pattern_vertical": ai_sections.get("pattern_vertical") or "",
+        "recommendations": ai_sections.get("recommendations") if isinstance(ai_sections.get("recommendations"), list) else [],
+        "conclusion": ai_sections.get("conclusion") or "",
+    }
+    return validate_ai_sections(
+        project,
+        snapshot,
+        metrics,
+        normalized_sections,
+        link_summary,
+        link_payload,
+    )

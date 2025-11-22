@@ -1,10 +1,12 @@
 import base64
+import html
 import io
 import json
 import math
 import os
 import re
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from math import radians, cos, sin, asin, sqrt, degrees
 from pathlib import Path
 from typing import Iterable
@@ -16,7 +18,7 @@ import numpy as np
 import pycraf
 import requests
 from sklearn.linear_model import LinearRegression
-from PIL import Image
+from PIL import Image, ImageDraw
 from astropy import units as u
 from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 from matplotlib.colors import LinearSegmentedColormap, ListedColormap, Normalize
@@ -40,18 +42,23 @@ from geopy.point import Point
 from types import SimpleNamespace
 from flask import (
     Blueprint,
+    Response,
     current_app,
     flash,
+    has_request_context,
     jsonify,
     redirect,
     render_template,
     request,
     send_file,
     send_from_directory,
+    session,
     url_for,
 )
 from flask_login import current_user, login_required, login_user, logout_user
 from sqlalchemy.exc import SQLAlchemyError
+
+from sqlalchemy import or_
 
 from extensions import db
 from user import User
@@ -62,9 +69,12 @@ from app_core.models import (
     CoverageEngine,
     CoverageJob,
     CoverageStatus,
+    ProjectReceiver,
+    ProjectCoverage,
 )
 from app_core.email_utils import generate_token, load_token, send_email
-from app_core.storage import ensure_storage_structure, ensure_project_path_exists, storage_root
+from app_core.storage import inline_asset_path
+from app_core.storage_utils import rehydrate_asset_data
 from app_core.reporting.service import generate_analysis_report, AnalysisReportError
 from app_core.data_acquisition import ensure_geodata_availability, ensure_rt3d_scene, global_srtm_dir
 from app_core.utils import (
@@ -78,6 +88,30 @@ from app_core.regulatory.service import build_default_payload
 from app_core.integrations import ibge as ibge_api
 
 GAIN_OFFSET_DBI_DBD = 2.15
+
+
+def _remember_active_project(project: Project | None) -> None:
+    if project and getattr(project, "slug", None):
+        session['active_project_slug'] = project.slug
+    else:
+        session.pop('active_project_slug', None)
+
+
+def _active_project_from_session() -> Project | None:
+    slug = session.get('active_project_slug')
+    if not slug:
+        return None
+    try:
+        return project_by_slug_or_404(slug, current_user.uuid)
+    except Exception:
+        session.pop('active_project_slug', None)
+        return None
+
+
+def _load_project_for_current_user(slug: str) -> Project:
+    project = project_by_slug_or_404(slug, current_user.uuid)
+    _remember_active_project(project)
+    return project
 
 
 def _gain_dbi_to_dbd(value):
@@ -114,8 +148,298 @@ def _create_default_project(user: User) -> Project:
     )
     db.session.add(project)
     db.session.flush()
-    ensure_storage_structure(str(user.uuid), project.slug)
     return project
+
+
+def _purge_project_asset_folders(project: Project, folders: Iterable[str]) -> None:
+    if not project:
+        return
+    path_prefix = f"{project.user_uuid}/{project.slug}/assets/"
+    for folder in folders:
+        prefix_like = f"{path_prefix}{folder}/%"
+        inline_like = f"inline://{folder}/%"
+        Asset.query.filter(
+            Asset.project_id == project.id,
+            or_(
+                Asset.path.like(prefix_like),
+                Asset.path.like(inline_like),
+            ),
+        ).delete(synchronize_session=False)
+
+
+def _asset_file_exists(asset: Asset | None) -> bool:
+    return bool(asset and getattr(asset, 'data', None))
+
+
+def _load_asset_bytes(asset_id: str | None = None, asset_path: str | None = None) -> bytes | None:
+    asset = None
+    if asset_id:
+        asset = Asset.query.filter_by(id=asset_id).first()
+    elif asset_path and str(asset_path).startswith('inline://'):
+        asset = Asset.query.filter_by(path=asset_path).first()
+    if asset:
+        if asset.data:
+            return bytes(asset.data)
+        payload = rehydrate_asset_data(asset)
+        if payload:
+            return payload
+    return None
+
+
+def _delete_receiver_profile_assets(project: Project, receiver_entry: dict) -> None:
+    asset = None
+    asset_id = receiver_entry.get('profile_asset_id')
+    if asset_id:
+        asset = Asset.query.filter_by(id=asset_id, project_id=project.id).first()
+    if asset:
+        db.session.delete(asset)
+
+
+def _serialize_project_receiver(record: ProjectReceiver, *, include_urls: bool = False) -> dict:
+    payload = dict(record.summary or {})
+    payload_id = payload.get('id') or record.legacy_id
+    payload['id'] = payload_id
+    payload.setdefault('label', record.label or payload_id)
+    location = payload.get('location') or {}
+    if record.latitude is not None:
+        location.setdefault('lat', record.latitude)
+        payload.setdefault('lat', record.latitude)
+    if record.longitude is not None:
+        location.setdefault('lng', record.longitude)
+        payload.setdefault('lng', record.longitude)
+    if location:
+        payload['location'] = location
+    if record.municipality and not payload.get('municipality'):
+        payload['municipality'] = record.municipality
+    if record.state and not payload.get('state'):
+        payload['state'] = record.state
+    asset = record.profile_asset
+    if _asset_file_exists(asset):
+        payload.setdefault('profile_asset_id', str(asset.id))
+        payload.setdefault('profile_asset_path', asset.path)
+        if include_urls and record.project and has_request_context():
+            try:
+                payload['profile_asset_url'] = url_for(
+                    'projects.asset_preview',
+                    slug=record.project.slug,
+                    asset_id=asset.id,
+                )
+            except Exception:
+                payload.pop('profile_asset_url', None)
+        elif not include_urls:
+            payload.pop('profile_asset_url', None)
+    else:
+        payload.pop('profile_asset_id', None)
+        payload.pop('profile_asset_path', None)
+        payload.pop('profile_asset_url', None)
+    payload.setdefault('ibge_code', record.ibge_code)
+    payload.setdefault('population', record.population)
+    payload.setdefault('population_year', record.population_year)
+    return payload
+
+
+def _is_valid_uuid(value) -> bool:
+    try:
+        uuid.UUID(str(value))
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _normalized_identifier(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {'none', 'null', 'undefined'}:
+        return None
+    return text
+
+
+def _project_receivers_payload(project: Project | None, *, include_urls: bool = False) -> list[dict]:
+    if not project:
+        return []
+    return [
+        _serialize_project_receiver(record, include_urls=include_urls)
+        for record in project.receivers
+    ]
+
+
+def _sanitize_tiles_payload(project: Project, tile_payload: dict | None) -> dict | None:
+    if not project or not tile_payload:
+        return None
+    asset_id = tile_payload.get('asset_id') or tile_payload.get('assetId')
+    asset_id = _normalized_identifier(asset_id)
+    if not asset_id:
+        return None
+    asset = Asset.query.filter_by(id=asset_id, project_id=project.id).first()
+    if not _asset_file_exists(asset):
+        return None
+    template = tile_payload.get('url_template') or tile_payload.get('urlTemplate')
+    if not template or '/None/' in template:
+        return None
+    sanitized = dict(tile_payload)
+    sanitized['asset_id'] = str(asset.id)
+    return sanitized
+
+
+def _serialize_project_coverage(record: ProjectCoverage | None) -> dict | None:
+    if not record:
+        return None
+    payload = dict(record.payload or {})
+    payload.setdefault('engine', record.engine)
+    if record.generated_at and not payload.get('generated_at'):
+        payload['generated_at'] = record.generated_at.isoformat()
+    if record.project:
+        payload.setdefault('project_slug', record.project.slug)
+    def _apply_asset_reference(payload_key, column_attr, path_key=None):
+        candidate = payload.get(payload_key)
+        candidate = _normalized_identifier(candidate)
+        asset_candidate = candidate or getattr(record, column_attr)
+        if not asset_candidate:
+            payload.pop(payload_key, None)
+            if path_key:
+                payload.pop(path_key, None)
+            return
+        if isinstance(asset_candidate, dict):
+            candidate_id = asset_candidate.get('id')
+        else:
+            candidate_id = asset_candidate
+        candidate_id = _normalized_identifier(candidate_id)
+        if not candidate_id:
+            payload.pop(payload_key, None)
+            if path_key:
+                payload.pop(path_key, None)
+            return
+        try:
+            uuid.UUID(candidate_id)
+        except (ValueError, AttributeError, TypeError):
+            payload.pop(payload_key, None)
+            if path_key:
+                payload.pop(path_key, None)
+            return
+        asset = Asset.query.filter_by(id=candidate_id, project_id=record.project_id).first()
+        if not asset or not _asset_file_exists(asset):
+            payload.pop(payload_key, None)
+            if path_key:
+                payload.pop(path_key, None)
+            return
+        payload[payload_key] = str(asset.id)
+        if path_key:
+            payload[path_key] = asset.path
+
+    _apply_asset_reference('asset_id', 'heatmap_asset_id', 'asset_path')
+    _apply_asset_reference('colorbar_asset_id', 'colorbar_asset_id')
+    _apply_asset_reference('map_snapshot_asset_id', 'map_snapshot_asset_id', 'map_snapshot_path')
+    _apply_asset_reference('json_asset_id', 'summary_asset_id')
+
+    tile_payload = payload.get('tiles')
+    if tile_payload:
+        sanitized_tiles = _sanitize_tiles_payload(record.project, tile_payload)
+        if sanitized_tiles:
+            payload['tiles'] = sanitized_tiles
+        else:
+            payload.pop('tiles', None)
+
+    payload.setdefault('receivers', _project_receivers_payload(record.project))
+    return payload
+
+
+def _sanitize_snapshot_assets(project: Project, snapshot: dict | None) -> dict | None:
+    if not project or not snapshot:
+        return snapshot
+    cleaned = dict(snapshot)
+    asset_keys = (
+        ('asset_id', 'asset_path'),
+        ('colorbar_asset_id', None),
+        ('map_snapshot_asset_id', 'map_snapshot_path'),
+        ('json_asset_id', None),
+    )
+    for key, path_key in asset_keys:
+        raw_id = cleaned.get(key)
+        asset_id = _normalized_identifier(raw_id)
+        if not asset_id:
+            continue
+        asset = Asset.query.filter_by(id=asset_id, project_id=project.id).first()
+        if not _asset_file_exists(asset):
+            cleaned.pop(key, None)
+            if path_key:
+                cleaned.pop(path_key, None)
+    tile_payload = cleaned.get('tiles')
+    if tile_payload:
+        sanitized_tiles = _sanitize_tiles_payload(project, tile_payload)
+        if sanitized_tiles:
+            cleaned['tiles'] = sanitized_tiles
+        else:
+            cleaned.pop('tiles', None)
+    return cleaned
+
+
+def _project_settings_with_dynamic(project: Project | None) -> dict:
+    base = dict(project.settings or {}) if project else {}
+    if project and base.get('lastCoverage'):
+        base['lastCoverage'] = _sanitize_snapshot_assets(project, base.get('lastCoverage'))
+    if project:
+        base['receiverBookmarks'] = _project_receivers_payload(project, include_urls=True)
+        coverage_payload = _serialize_project_coverage(
+            ProjectCoverage.query.filter_by(project_id=project.id)
+            .order_by(ProjectCoverage.generated_at.desc().nullslast(), ProjectCoverage.created_at.desc().nullslast())
+            .first()
+        )
+        if coverage_payload:
+            base['lastCoverage'] = coverage_payload
+        elif 'lastCoverage' in base:
+            base.pop('lastCoverage', None)
+    return base
+
+
+def _persist_project_coverage_record(
+    project: Project,
+    summary_payload: dict,
+    *,
+    heatmap_asset=None,
+    colorbar_asset=None,
+    map_snapshot_asset=None,
+    summary_asset=None,
+) -> None:
+    summary = dict(summary_payload or {})
+    summary.setdefault('project_slug', project.slug)
+    summary.setdefault('receivers', _project_receivers_payload(project))
+    record = ProjectCoverage(
+        project_id=project.id,
+        engine=summary.get('engine'),
+        generated_at=datetime.utcnow().replace(tzinfo=timezone.utc),
+        payload=summary,
+        heatmap_asset_id=heatmap_asset.id if heatmap_asset else None,
+        colorbar_asset_id=colorbar_asset.id if colorbar_asset else None,
+        map_snapshot_asset_id=map_snapshot_asset.id if map_snapshot_asset else None,
+        summary_asset_id=summary_asset.id if summary_asset else None,
+    )
+    db.session.add(record)
+
+
+def _parse_iso_datetime(value):
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if not text:
+            return None
+        dt = datetime.fromisoformat(text.replace('Z', '+00:00'))
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc)
+        return dt.replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def _normalize_datetime(dt):
+    if dt is None:
+        return None
+    if isinstance(dt, datetime):
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    return _parse_iso_datetime(dt)
 
 
 # ==========================================================================
@@ -509,7 +833,8 @@ def salvar_dados():
     project_slug = request.args.get('project') or data.get('projectSlug')
     project = None
     if project_slug:
-        project = project_by_slug_or_404(project_slug, current_user.uuid)
+        project = _load_project_for_current_user(project_slug)
+        _remember_active_project(project)
 
     coverage_engine = data.get('coverageEngine') or CoverageEngine.p1546.value
     valid_engines = {engine.value for engine in CoverageEngine}
@@ -541,6 +866,9 @@ def salvar_dados():
                 if incoming_key == "antennaGain":
                     value = value + GAIN_OFFSET_DBI_DBD
                 setattr(current_user, model_attr, value)
+
+    # Ganho de receptor fixo em 0 dBi para estudos ponto-área
+    current_user.rx_gain = 0.0
 
     # tempo percentual (0.001 a 50%)
     if "timePercentage" in data:
@@ -601,7 +929,7 @@ def salvar_dados():
             "propagationModel": current_user.propagation_model,
             "Total_loss": current_user.total_loss,
             "antennaGain": current_user.antenna_gain,
-            "rxGain": current_user.rx_gain,
+            "rxGain": 0.0,
             "transmissionPower": current_user.transmission_power,
             "frequency": current_user.frequencia,
             "towerHeight": current_user.tower_height,
@@ -677,7 +1005,7 @@ def salvar_dados():
         "rxHeight": current_user.rx_height,
         "Total_loss": current_user.total_loss,
         "antennaGain": current_user.antenna_gain,
-        "rxGain": current_user.rx_gain,
+        "rxGain": 0.0,
         "transmissionPower": current_user.transmission_power,
         "frequency": current_user.frequencia,
         "antennaTilt": getattr(current_user, "antenna_tilt", None),
@@ -745,21 +1073,24 @@ def calcular_cobertura():
     active_project = None
     if requested_slug:
         try:
-            active_project = project_by_slug_or_404(requested_slug, current_user.uuid)
+            active_project = _load_project_for_current_user(requested_slug)
         except Exception:
             if projects:
                 active_project = projects[0]
-    elif projects:
+    if not active_project:
+        session_project = _active_project_from_session()
+        if session_project:
+            active_project = session_project
+    if not active_project and projects:
         def _coverage_sort_key(proj: Project):
             settings = proj.settings or {}
             coverage = settings.get('lastCoverage') or {}
             generated = coverage.get('generated_at')
-            if generated:
-                try:
-                    return datetime.fromisoformat(generated)
-                except ValueError:
-                    pass
-            return proj.created_at or datetime.min
+            generated_dt = _parse_iso_datetime(generated)
+            if generated_dt:
+                return generated_dt
+            fallback_dt = _normalize_datetime(proj.created_at)
+            return fallback_dt or datetime.min
 
         try:
             active_project = max(projects, key=_coverage_sort_key)
@@ -770,6 +1101,7 @@ def calcular_cobertura():
         # slug informado mas nenhum projeto encontrado
         flash('Projeto não encontrado ou sem acesso.', 'error')
         return redirect(url_for('projects.list_projects'))
+    _remember_active_project(active_project)
 
     engines = list(CoverageEngine)
     selected_engine = None
@@ -822,7 +1154,7 @@ def download_report():
     project_slug = request.args.get('project')
     project = None
     if project_slug:
-        project = project_by_slug_or_404(project_slug, current_user.uuid)
+        project = _load_project_for_current_user(project_slug)
     else:
         project = (
             current_user.projects.order_by(Project.created_at.desc()).first()
@@ -835,10 +1167,15 @@ def download_report():
             report_entry = generate_analysis_report(project)
             asset = Asset.query.filter_by(id=report_entry.pdf_asset_id).first()
             if asset:
-                pdf_path = storage_root() / asset.path
-                if pdf_path.exists():
+                blob = _load_asset_bytes(asset_id=str(asset.id), asset_path=asset.path)
+                if blob:
                     filename = f"relatorio_{project.slug}.pdf"
-                    return send_file(pdf_path, as_attachment=True, download_name=filename, mimetype='application/pdf')
+                    return send_file(
+                        io.BytesIO(blob),
+                        as_attachment=True,
+                        download_name=filename,
+                        mimetype='application/pdf',
+                    )
             raise AnalysisReportError("Falha ao localizar o PDF gerado.")
         except AnalysisReportError as exc:
             current_app.logger.warning(
@@ -947,11 +1284,15 @@ def mapa():
 
     if project_slug:
         try:
-            active_project = project_by_slug_or_404(project_slug, current_user.uuid)
+            active_project = _load_project_for_current_user(project_slug)
         except Exception:
             flash("Projeto não encontrado ou sem acesso.", "error")
             return redirect(url_for("projects.list_projects"))
-    elif projects:
+    if not active_project:
+        session_project = _active_project_from_session()
+        if session_project:
+            active_project = session_project
+    if not active_project and projects:
         active_project = projects[0]
 
     # Se o usuário não tem posição definida, redireciona para configurar
@@ -970,6 +1311,7 @@ def mapa():
         if project_lat is not None and project_lng is not None:
             start_coords = {"lat": project_lat, "lng": project_lng}
 
+    _remember_active_project(active_project)
     return render_template(
         "mapa.html",
         start_coords=start_coords,
@@ -1150,10 +1492,15 @@ def home():
     selected_project = None
     if requested_slug:
         selected_project = next((p for p in projects if p.slug == requested_slug), None)
+    if not selected_project:
+        session_project = _active_project_from_session()
+        if session_project:
+            selected_project = next((p for p in projects if p.slug == session_project.slug), None)
     if not selected_project and projects:
         selected_project = projects[0]
+    _remember_active_project(selected_project)
 
-    project_settings = (selected_project.settings or {}) if selected_project else {}
+    project_settings = _project_settings_with_dynamic(selected_project) if selected_project else {}
 
     # snapshot já contempla merge entre job e artifacts;
     # usamos o helper para não duplicar lógica com outras telas.
@@ -1181,14 +1528,6 @@ def home():
             return getattr(current_user, user_attr, None)
         return None
 
-    def _parse_iso_timestamp(value):
-        if not value:
-            return None
-        try:
-            return datetime.fromisoformat(value.replace('Z', '+00:00'))
-        except Exception:
-            return None
-
     def _format_metric(label, value, unit=None, precision=2):
         if value is None or value == '':
             return {'label': label, 'value': '—', 'is_empty': True}
@@ -1204,6 +1543,9 @@ def home():
 
     def _asset_url(asset_id):
         if not (selected_project and asset_id):
+            return None
+        asset = Asset.query.filter_by(id=asset_id, project_id=selected_project.id).first()
+        if not _asset_file_exists(asset):
             return None
         try:
             return url_for('projects.asset_preview', slug=selected_project.slug, asset_id=asset_id)
@@ -1322,7 +1664,7 @@ def home():
         coverage_radius_km = project_settings.get('radius')
 
     coverage_generated_at = coverage_snapshot.get('generated_at') if isinstance(coverage_snapshot, dict) else None
-    coverage_generated_at_dt = _parse_iso_timestamp(coverage_generated_at)
+    coverage_generated_at_dt = _parse_iso_datetime(coverage_generated_at)
 
     tx_coordinates = None
     if isinstance(coverage_snapshot, dict):
@@ -1416,11 +1758,17 @@ def home():
     coverage_radius_km = _coerce_float(coverage_radius_km)
 
     coverage_artifacts = {
+        'map_snapshot_url': _asset_url(coverage_snapshot.get('map_snapshot_asset_id')) if coverage_snapshot else None,
         'heatmap_url': _asset_url(coverage_snapshot.get('asset_id')) if coverage_snapshot else None,
         'colorbar_url': _asset_url(coverage_snapshot.get('colorbar_asset_id')) if coverage_snapshot else None,
         'rt3d_viewer_url': url_for('ui.rt3d_viewer', project=selected_project.slug)
         if (selected_project and isinstance(coverage_snapshot, dict) and coverage_snapshot.get('rt3d_scene'))
         else None,
+        'kml_url': (
+            url_for('ui.download_coverage_kml', slug=selected_project.slug)
+            if selected_project and coverage_snapshot
+            else None
+        ),
     }
 
     receivers_summary = _normalize_receivers(coverage_snapshot.get('receivers') if isinstance(coverage_snapshot, dict) else [])[:4] if coverage_snapshot else []
@@ -1926,7 +2274,7 @@ def update_notes():
 @bp.route('/projects/<slug>/regulator/payload', methods=['GET'])
 @login_required
 def regulatory_payload(slug):
-    project = project_by_slug_or_404(slug, current_user.uuid)
+    project = _load_project_for_current_user(slug)
     payload = build_default_payload(project)
     return jsonify({'project': project.slug, 'data': payload})
 
@@ -1965,19 +2313,14 @@ def _slug_for_filename(label: str | None) -> str:
 
 
 def _persist_receiver_profile_asset(project: Project, receiver_label: str | None, image_bytes: bytes):
-    storage_dir = ensure_project_path_exists(project, 'assets', 'profiles')
-    timestamp = datetime.utcnow().strftime('%Y%m%d_%H%M%S')
-    slug = _slug_for_filename(receiver_label)
-    filename = f"{slug}_{timestamp}.png"
-    file_path = storage_dir / filename
-    file_path.write_bytes(image_bytes)
-    rel_path = file_path.relative_to(storage_root())
+    pseudo_path = inline_asset_path('profiles', 'png')
     asset = Asset(
         project_id=project.id,
         type=AssetType.png,
-        path=str(rel_path),
+        path=pseudo_path,
         mime_type='image/png',
-        byte_size=file_path.stat().st_size,
+        byte_size=len(image_bytes),
+        data=image_bytes,
         meta={
             'kind': 'receiver_profile',
             'label': receiver_label,
@@ -1995,24 +2338,39 @@ def _upsert_project_receiver(project: Project, receiver_payload: dict):
     receiver_id = receiver_payload.get('id')
     if not receiver_id:
         return
-    settings = dict(project.settings or {})
-    entries = list(settings.get('receiverBookmarks') or [])
-    updated = False
-    for idx, entry in enumerate(entries):
-        if entry.get('id') == receiver_id:
-            new_entry = dict(entry)
-            new_entry.update(receiver_payload)
-            new_entry['updated_at'] = datetime.utcnow().isoformat()
-            entries[idx] = new_entry
-            updated = True
-            break
-    if not updated:
-        receiver_payload = dict(receiver_payload)
-        receiver_payload['created_at'] = datetime.utcnow().isoformat()
-        receiver_payload['updated_at'] = receiver_payload['created_at']
-        entries.append(receiver_payload)
-    settings['receiverBookmarks'] = entries
-    project.settings = settings
+    record = ProjectReceiver.query.filter_by(
+        project_id=project.id,
+        legacy_id=str(receiver_id),
+    ).first()
+    if not record:
+        record = ProjectReceiver(project_id=project.id, legacy_id=str(receiver_id))
+    record.label = receiver_payload.get('label') or record.label or receiver_id
+    location = receiver_payload.get('location') or {}
+    lat = receiver_payload.get('lat') or location.get('lat') or location.get('latitude')
+    lon = (
+        receiver_payload.get('lng')
+        or receiver_payload.get('lon')
+        or location.get('lng')
+        or location.get('longitude')
+    )
+    try:
+        record.latitude = float(lat) if lat is not None else None
+    except (TypeError, ValueError):
+        record.latitude = None
+    try:
+        record.longitude = float(lon) if lon is not None else None
+    except (TypeError, ValueError):
+        record.longitude = None
+    record.municipality = receiver_payload.get('municipality') or location.get('municipality') or location.get('city')
+    record.state = receiver_payload.get('state') or location.get('state') or location.get('uf')
+    record.summary = dict(receiver_payload)
+    ibge_info = receiver_payload.get('ibge') or {}
+    record.ibge_code = ibge_info.get('code') or receiver_payload.get('ibge_code')
+    record.population = receiver_payload.get('population')
+    record.population_year = receiver_payload.get('population_year')
+    profile_asset_id = receiver_payload.get('profile_asset_id')
+    record.profile_asset_id = profile_asset_id
+    db.session.add(record)
 
 
 def generate_coverage_image(lons, lats, _total_atten, radius_km, lon_center, lat_center):
@@ -2128,7 +2486,7 @@ def gerar_img_perfil():
     project_slug = data.get('projectSlug') or data.get('project_slug')
     project = None
     if project_slug:
-        project = project_by_slug_or_404(project_slug, current_user.uuid)
+        project = _load_project_for_current_user(project_slug)
     receiver_id = data.get('receiverId') or data.get('receiver_id')
     receiver_label = data.get('receiverLabel') or data.get('receiver_label')
     receiver_summary = data.get('summary') if isinstance(data.get('summary'), dict) else {}
@@ -2946,10 +3304,10 @@ def _compute_haat_radials(
     dem_directory=None,
     inner_km=3.0,
     outer_km=16.0,
-    bearing_step_deg=15,
+    bearing_step_deg=45,
     profile_step_m=200.0,
 ):
-    """Calcula HAAT médio com radiais a cada 15° usando perfis SRTM."""
+    """Calcula HMNT/HAAT médio com radiais usando perfis SRTM."""
     try:
         lat = float(lat_deg)
         lon = float(lon_deg)
@@ -3013,16 +3371,18 @@ def _compute_haat_radials(
         site_elevation = float(site_elevation_m) if site_elevation_m is not None else float(ground_m[0])
         haat_value = (site_elevation + tower_height) - avg_ground
 
-        radials.append({
+        radial_entry = {
             'bearing_deg': float(bearing),
             'avg_terrain_m': round(avg_ground, 2),
             'haat_m': round(haat_value, 2),
-        })
+            'hmnt_m': round(haat_value, 2),
+        }
+        radials.append(radial_entry)
 
     if not radials:
         return [], None
 
-    haat_average = round(float(np.nanmean([item['haat_m'] for item in radials])), 2)
+    haat_average = round(float(np.nanmean([item.get('hmnt_m') for item in radials])), 2)
     return radials, haat_average
 
 
@@ -3662,19 +4022,6 @@ def _compute_rt3d_only_map(tx, data, include_arrays=False, label=None, rt3d_scen
     except Exception:
         haat_radials, haat_average = [], None
 
-    haat_radials: list[dict] = []
-    haat_average = None
-    try:
-        haat_radials, haat_average = _compute_haat_radials(
-            lat_tx_deg,
-            lon_tx_deg,
-            getattr(tx, 'tower_height', None),
-            getattr(tx, 'tx_site_elevation', None),
-            dem_directory=dem_directory,
-        )
-    except Exception:
-        haat_radials, haat_average = [], None
-
     radius_requested = _coerce_optional(data.get('radius'))
     if radius_requested is None or radius_requested <= 0:
         radius_requested = 10.0
@@ -3976,6 +4323,364 @@ def _compute_rt3d_only_map(tx, data, include_arrays=False, label=None, rt3d_scen
 
     return payload
 
+def _normalize_bounds_payload(bounds):
+    if not bounds:
+        return None
+    if isinstance(bounds, dict):
+        north = _coerce_float(
+            bounds.get('north')
+            or bounds.get('max_lat')
+            or bounds.get('maxLat')
+            or (bounds.get('northEast') or {}).get('lat')
+        )
+        south = _coerce_float(
+            bounds.get('south')
+            or bounds.get('min_lat')
+            or bounds.get('minLat')
+            or (bounds.get('southWest') or {}).get('lat')
+        )
+        east = _coerce_float(
+            bounds.get('east')
+            or bounds.get('max_lng')
+            or bounds.get('maxLon')
+            or bounds.get('maxLon')
+            or (bounds.get('northEast') or {}).get('lng')
+            or (bounds.get('northEast') or {}).get('lon')
+        )
+        west = _coerce_float(
+            bounds.get('west')
+            or bounds.get('min_lng')
+            or bounds.get('minLon')
+            or (bounds.get('southWest') or {}).get('lng')
+            or (bounds.get('southWest') or {}).get('lon')
+        )
+    elif isinstance(bounds, (list, tuple)) and len(bounds) >= 4:
+        south = _coerce_float(bounds[0])
+        west = _coerce_float(bounds[1])
+        north = _coerce_float(bounds[2])
+        east = _coerce_float(bounds[3])
+    else:
+        return None
+
+    if None in (north, south, east, west):
+        return None
+    # normaliza longitude para [-180, 180]
+    if east - west > 360:
+        east = west + 360
+    def _normalize_lon(value):
+        if value is None:
+            return None
+        value = float(value)
+        while value > 180:
+            value -= 360
+        while value < -180:
+            value += 360
+        return value
+    return {
+        'north': float(north),
+        'south': float(south),
+        'east': _normalize_lon(east),
+        'west': _normalize_lon(west),
+    }
+
+
+def _normalize_point_payload(point):
+    if isinstance(point, dict):
+        lat = _coerce_float(point.get('lat') or point.get('latitude'))
+        lng = _coerce_float(point.get('lng') or point.get('lon') or point.get('longitude'))
+    elif isinstance(point, (list, tuple)) and len(point) >= 2:
+        lat = _coerce_float(point[0])
+        lng = _coerce_float(point[1])
+    else:
+        lat = None
+        lng = None
+    if lat is None or lng is None:
+        return (None, None)
+    return (float(lat), float(lng))
+
+
+def _latlon_to_pixel_xy(lat, lon, zoom, tile_size=256):
+    siny = math.sin(math.radians(lat))
+    siny = min(max(siny, -0.9999), 0.9999)
+    scale = tile_size * (2 ** zoom)
+    x = (lon + 180.0) / 360.0 * scale
+    y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * scale
+    return x, y
+
+
+def _estimate_zoom_from_bounds(bounds, width_px, height_px):
+    if not bounds:
+        return 12
+
+    def _lat_rad(lat):
+        siny = math.sin(math.radians(lat))
+        siny = min(max(siny, -0.9999), 0.9999)
+        return math.log((1 + siny) / (1 - siny)) / 2
+
+    lat_fraction = abs(_lat_rad(bounds['north']) - _lat_rad(bounds['south'])) / math.pi
+    lon_diff = bounds['east'] - bounds['west']
+    if lon_diff < 0:
+        lon_diff += 360
+    lon_fraction = abs(lon_diff) / 360
+
+    if lat_fraction == 0:
+        lat_fraction = 1e-6
+    if lon_fraction == 0:
+        lon_fraction = 1e-6
+
+    lat_zoom = math.log(height_px / 256 / lat_fraction) / math.log(2)
+    lon_zoom = math.log(width_px / 256 / lon_fraction) / math.log(2)
+    zoom = min(lat_zoom, lon_zoom) - 0.5  # margem
+    zoom = max(3, min(18, zoom))
+    return int(round(zoom))
+
+
+def _download_static_map_image(center_lat, center_lng, zoom, size_px, scale, api_key, project_slug=None):
+    params = {
+        'center': f'{center_lat},{center_lng}',
+        'zoom': max(3, min(20, int(zoom))),
+        'size': f'{size_px}x{size_px}',
+        'scale': scale,
+        'maptype': 'roadmap',
+        'style': 'feature:poi|visibility:off',
+        'key': api_key,
+    }
+    try:
+        response = requests.get(
+            'https://maps.googleapis.com/maps/api/staticmap',
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        return Image.open(io.BytesIO(response.content)).convert('RGB')
+    except Exception as exc:
+        current_app.logger.warning(
+            'coverage.map_snapshot.fetch_failed',
+            extra={'project': project_slug or '-', 'error': str(exc)},
+        )
+        return None
+
+
+def _fetch_osm_tile(session, zoom, x, y, user_agent=None):
+    url = f'https://tile.openstreetmap.org/{zoom}/{x}/{y}.png'
+    headers = {'User-Agent': user_agent or 'ATXCoverage/1.0 (+tile-capture)'}
+    resp = session.get(url, headers=headers, timeout=20)
+    resp.raise_for_status()
+    return Image.open(io.BytesIO(resp.content)).convert('RGB')
+
+
+def _build_osm_static_map(center_lat, center_lng, zoom, width_px, height_px, project_slug=None):
+    tile_size = 256
+    num_tiles = 2 ** zoom
+    if num_tiles <= 0:
+        return None
+    center_x, center_y = _latlon_to_pixel_xy(center_lat, center_lng, zoom)
+    top_left_x = center_x - (width_px / 2.0)
+    top_left_y = center_y - (height_px / 2.0)
+    bottom_right_x = center_x + (width_px / 2.0)
+    bottom_right_y = center_y + (height_px / 2.0)
+
+    tile_x_start = math.floor(top_left_x / tile_size)
+    tile_y_start = math.floor(top_left_y / tile_size)
+    tile_x_end = math.floor((bottom_right_x - 1) / tile_size)
+    tile_y_end = math.floor((bottom_right_y - 1) / tile_size)
+
+    mosaic_width_px = (tile_x_end - tile_x_start + 1) * tile_size
+    mosaic_height_px = (tile_y_end - tile_y_start + 1) * tile_size
+    if mosaic_width_px <= 0 or mosaic_height_px <= 0:
+        return None
+
+    session = requests.Session()
+    mosaic = Image.new('RGB', (mosaic_width_px, mosaic_height_px), (240, 240, 240))
+    for ix, tile_x in enumerate(range(tile_x_start, tile_x_end + 1)):
+        wrapped_x = tile_x % num_tiles
+        for iy, tile_y in enumerate(range(tile_y_start, tile_y_end + 1)):
+            paste_x = ix * tile_size
+            paste_y = iy * tile_size
+            if tile_y < 0 or tile_y >= num_tiles:
+                tile_img = Image.new('RGB', (tile_size, tile_size), (238, 238, 238))
+            else:
+                try:
+                    tile_img = _fetch_osm_tile(session, zoom, wrapped_x, tile_y)
+                except Exception as exc:
+                    current_app.logger.warning(
+                        'coverage.osm_tile_failed',
+                        extra={'project': project_slug or '-', 'zoom': zoom, 'tile': f'{wrapped_x}/{tile_y}', 'error': str(exc)},
+                    )
+                    tile_img = Image.new('RGB', (tile_size, tile_size), (238, 238, 238))
+            mosaic.paste(tile_img, (paste_x, paste_y))
+            tile_img.close()
+
+    crop_x = int(round(top_left_x - tile_x_start * tile_size))
+    crop_y = int(round(top_left_y - tile_y_start * tile_size))
+    crop_box = (
+        max(0, crop_x),
+        max(0, crop_y),
+        min(mosaic.width, crop_x + width_px),
+        min(mosaic.height, crop_y + height_px),
+    )
+    if crop_box[2] <= crop_box[0] or crop_box[3] <= crop_box[1]:
+        return mosaic
+    cropped = mosaic.crop(crop_box)
+    if cropped.size != (width_px, height_px):
+        padded = Image.new('RGB', (width_px, height_px), (240, 240, 240))
+        padded.paste(cropped, (0, 0))
+        mosaic.close()
+        return padded
+    return cropped
+
+
+def _overlay_heatmap_on_base(base_img, heatmap_path, bounds, center_lat, center_lng, zoom, opacity):
+    try:
+        overlay_img = Image.open(heatmap_path).convert('RGBA')
+    except Exception:
+        return base_img.convert('RGBA')
+
+    width_px, height_px = base_img.size
+    center_x, center_y = _latlon_to_pixel_xy(center_lat, center_lng, zoom)
+    top_left_x = center_x - (width_px / 2)
+    top_left_y = center_y - (height_px / 2)
+
+    nw_x, nw_y = _latlon_to_pixel_xy(bounds['north'], bounds['west'], zoom)
+    se_x, se_y = _latlon_to_pixel_xy(bounds['south'], bounds['east'], zoom)
+
+    left = min(nw_x, se_x)
+    right = max(nw_x, se_x)
+    top = min(nw_y, se_y)
+    bottom = max(nw_y, se_y)
+
+    target_width = max(1, int(round(right - left)))
+    target_height = max(1, int(round(bottom - top)))
+
+    resized_overlay = overlay_img.resize((target_width, target_height), resample=Image.BILINEAR)
+
+    alpha = resized_overlay.getchannel('A') if 'A' in resized_overlay.getbands() else Image.new('L', resized_overlay.size, color=255)
+    alpha = alpha.point(lambda px: int(px * opacity))
+    resized_overlay.putalpha(alpha)
+
+    overlay_canvas = Image.new('RGBA', (width_px, height_px), (0, 0, 0, 0))
+    paste_x = int(round(left - top_left_x))
+    paste_y = int(round(top - top_left_y))
+
+    crop_left = max(0, -paste_x)
+    crop_top = max(0, -paste_y)
+    crop_right = min(resized_overlay.width, overlay_canvas.width - paste_x + crop_left)
+    crop_bottom = min(resized_overlay.height, overlay_canvas.height - paste_y + crop_top)
+
+    if crop_right <= crop_left or crop_bottom <= crop_top:
+        overlay_img.close()
+        resized_overlay.close()
+        return base_img.convert('RGBA')
+
+    cropped = resized_overlay.crop((crop_left, crop_top, crop_right, crop_bottom))
+    overlay_canvas.paste(cropped, (max(paste_x, 0), max(paste_y, 0)), cropped)
+
+    base_rgba = base_img.convert('RGBA')
+    combined = Image.alpha_composite(base_rgba, overlay_canvas)
+
+    overlay_img.close()
+    resized_overlay.close()
+    cropped.close()
+    return combined
+
+
+def _append_colorbar_to_snapshot(base_img, colorbar_blob):
+    if not colorbar_blob:
+        return base_img
+    try:
+        colorbar_img = Image.open(io.BytesIO(colorbar_blob)).convert('RGBA')
+    except Exception:
+        return base_img
+
+    max_width = max(50, base_img.width - 80)
+    target_width = min(max_width, colorbar_img.width)
+    ratio = target_width / float(colorbar_img.width)
+    target_height = max(1, int(round(colorbar_img.height * ratio)))
+
+    resized = colorbar_img.resize((target_width, target_height), resample=Image.LANCZOS)
+
+    canvas = Image.new('RGBA', (base_img.width, base_img.height + target_height + 48), (255, 255, 255, 255))
+    canvas.paste(base_img, (0, 0))
+    text_position = (40, base_img.height + 10)
+    draw = ImageDraw.Draw(canvas)
+    draw.text(text_position, "Escala aplicada [dBµV/m]", fill=(31, 41, 55))
+
+    canvas.paste(resized, ((canvas.width - target_width) // 2, base_img.height + 24), resized)
+
+    colorbar_img.close()
+    resized.close()
+    base_img.close()
+    return canvas
+
+
+def _render_map_snapshot_image(
+    heatmap_bytes: bytes | None,
+    colorbar_bytes: bytes | None,
+    bounds_payload,
+    center_payload,
+    project_slug=None,
+    radius_km=None,
+):
+    bounds = _normalize_bounds_payload(bounds_payload)
+    if not bounds or not heatmap_bytes:
+        return None
+
+    center_lat, center_lng = _normalize_point_payload(center_payload)
+    if center_lat is None or center_lng is None:
+        center_lat = (bounds['north'] + bounds['south']) / 2.0
+        center_lng = (bounds['east'] + bounds['west']) / 2.0
+
+    base_size = 640
+    scale = 2
+    width_px = base_size * scale
+    height_px = base_size * scale
+    zoom = _estimate_zoom_from_bounds(bounds, width_px, height_px)
+    if radius_km and center_lat is not None:
+        try:
+            radius_value = max(float(radius_km), 1.0)
+            diameter_m = radius_value * 2000.0
+            target_pixels = width_px * 0.75
+            cos_lat = max(math.cos(math.radians(center_lat)), 0.2)
+            meters_per_pixel = max(diameter_m / target_pixels, 1.0)
+            zoom_radius = math.log2((156543.03392 * cos_lat) / meters_per_pixel)
+            zoom = min(18, max(zoom, zoom_radius))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+    zoom = max(3.0, min(18.0, zoom))
+    zoom = int(round(zoom))
+    base_img = None
+    google_key = get_google_maps_key()
+    if google_key:
+        base_img = _download_static_map_image(center_lat, center_lng, zoom, base_size, scale, google_key, project_slug=project_slug)
+    if base_img is None:
+        base_img = _build_osm_static_map(center_lat, center_lng, zoom, width_px, height_px, project_slug=project_slug)
+    if base_img is None:
+        return None
+
+    try:
+        composed = _overlay_heatmap_on_base(
+            base_img,
+            io.BytesIO(heatmap_bytes),
+            bounds,
+            center_lat,
+            center_lng,
+            zoom,
+            opacity=0.78,
+        )
+        final_canvas = _append_colorbar_to_snapshot(composed, colorbar_bytes)
+        final_rgb = final_canvas.convert('RGB')
+        buffer = io.BytesIO()
+        final_rgb.save(buffer, format='PNG', optimize=True)
+        buffer.seek(0)
+        snapshot_bytes = buffer.read()
+        final_rgb.close()
+        final_canvas.close()
+        composed.close()
+    finally:
+        base_img.close()
+    return zoom, snapshot_bytes
+
+
 
 def _persist_coverage_artifacts(user, project, engine_value, request_payload, coverage_payload):
     if project is None:
@@ -4003,16 +4708,6 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         except TypeError:
             return data
 
-    storage_paths = ensure_storage_structure(str(user.uuid), project.slug)
-    coverage_dir = storage_paths.get('assets/coverage')
-    if coverage_dir is None:
-        coverage_dir = storage_root() / str(user.uuid) / project.slug / 'assets' / 'coverage'
-        coverage_dir.mkdir(parents=True, exist_ok=True)
-    else:
-        coverage_dir = Path(coverage_dir)
-
-    root_path = storage_root()
-
     def _decode_image_b64(data_str):
         if not data_str:
             return b''
@@ -4035,15 +4730,6 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
 
     heatmap_bytes = _decode_image_b64(selected_image.get('image') if selected_image else None)
     colorbar_bytes = _decode_image_b64(selected_image.get('colorbar') if selected_image else None)
-
-    heatmap_path = coverage_dir / f"{base_name}_field.png"
-    colorbar_path = coverage_dir / f"{base_name}_colorbar.png"
-    json_path = coverage_dir / f"{base_name}_summary.json"
-
-    if heatmap_bytes:
-        heatmap_path.write_bytes(heatmap_bytes)
-    if colorbar_bytes:
-        colorbar_path.write_bytes(colorbar_bytes)
 
     receivers_payload = coverage_payload.get('receivers') or request_payload.get('receivers')
 
@@ -4080,6 +4766,93 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
         summary_payload["haat_average_m"] = _clean_json(coverage_payload.get('haat_average_m'))
     summary_payload["diagram_horizontal_b64"] = _encode_blob(getattr(user, 'antenna_pattern_img_dia_H', None))
     summary_payload["diagram_vertical_b64"] = _encode_blob(getattr(user, 'antenna_pattern_img_dia_V', None))
+
+    def _create_asset_from_bytes(kind: str, extension: str, blob: bytes | None, asset_type: AssetType, meta: dict) -> Asset | None:
+        if not blob:
+            return None
+        meta = dict(meta or {})
+        mime = meta.pop('mime_type', None) or ('application/json' if extension.endswith('json') else 'image/png')
+        asset = Asset(
+            project_id=project.id,
+            type=asset_type,
+            path=inline_asset_path(kind, extension),
+            mime_type=mime,
+            byte_size=len(blob),
+            data=blob,
+            meta=meta,
+        )
+        db.session.add(asset)
+        return asset
+
+    heatmap_asset = _create_asset_from_bytes(
+        'coverage',
+        'png',
+        heatmap_bytes,
+        AssetType.heatmap,
+        {
+            "engine": engine_enum.value,
+            "generated_at": timestamp_iso,
+            "unit": selected_image.get('unit') if selected_image else None,
+            "label": selected_image.get('label') if selected_image else None,
+            "radius_km": coverage_payload.get('requested_radius_km'),
+        },
+    )
+
+    colorbar_asset = _create_asset_from_bytes(
+        'coverage',
+        'png',
+        colorbar_bytes,
+        AssetType.png,
+        {
+            "engine": engine_enum.value,
+            "generated_at": timestamp_iso,
+            "label": selected_image.get('label') if selected_image else None,
+        },
+    ) if colorbar_bytes else None
+
+    map_snapshot_asset = None
+    map_snapshot_zoom = None
+    bounds_payload = coverage_payload.get('bounds')
+    if bounds_payload and heatmap_bytes:
+        try:
+            render_result = _render_map_snapshot_image(
+                heatmap_bytes,
+                colorbar_bytes,
+                bounds_payload,
+                coverage_payload.get('center') or coverage_payload.get('tx_location'),
+                project_slug=project.slug,
+                radius_km=coverage_payload.get('requested_radius_km') or coverage_payload.get('radius'),
+            )
+        except Exception as exc:
+            current_app.logger.warning(
+                'coverage.snapshot.render_failed',
+                extra={'error': str(exc)},
+            )
+            render_result = None
+        if render_result:
+            map_snapshot_zoom, snapshot_blob = render_result
+            map_snapshot_asset = _create_asset_from_bytes(
+                'coverage',
+                'png',
+                snapshot_blob,
+                AssetType.png,
+                {
+                    "engine": engine_enum.value,
+                    "generated_at": timestamp_iso,
+                    "zoom": map_snapshot_zoom,
+                },
+            )
+
+    if heatmap_asset:
+        summary_payload["asset_id"] = str(heatmap_asset.id)
+        summary_payload["asset_path"] = heatmap_asset.path
+    if colorbar_asset:
+        summary_payload["colorbar_asset_id"] = str(colorbar_asset.id)
+    if map_snapshot_asset:
+        summary_payload["map_snapshot_asset_id"] = str(map_snapshot_asset.id)
+        summary_payload["map_snapshot_path"] = map_snapshot_asset.path
+        summary_payload["map_snapshot_zoom"] = map_snapshot_zoom
+
     ibge_registry = {}
     if receivers_payload:
         for receiver in receivers_payload:
@@ -4090,60 +4863,16 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
             ibge_registry[str(code)] = _clean_json(ibge_info)
     if ibge_registry:
         summary_payload["ibge_registry"] = ibge_registry
+    if not summary_payload.get('receivers'):
+        summary_payload["receivers"] = _clean_json(_project_receivers_payload(project))
     if coverage_payload.get('rt3dScene'):
         summary_payload["rt3d_scene"] = _clean_json(coverage_payload.get('rt3dScene'))
     if coverage_payload.get('rt3dDiagnostics'):
         summary_payload["rt3d_diagnostics"] = _clean_json(coverage_payload.get('rt3dDiagnostics'))
-    heatmap_asset = Asset(
-        project_id=project.id,
-        type=AssetType.heatmap,
-        path=str(heatmap_path.relative_to(root_path)),
-        mime_type='image/png',
-        byte_size=heatmap_path.stat().st_size if heatmap_path.exists() else 0,
-        meta={
-            "engine": engine_enum.value,
-            "generated_at": timestamp_iso,
-            "unit": selected_image.get('unit') if selected_image else None,
-            "label": selected_image.get('label') if selected_image else None,
-            "radius_km": coverage_payload.get('requested_radius_km'),
-        },
-    )
-    db.session.add(heatmap_asset)
-
-    json_asset = Asset(
-        project_id=project.id,
-        type=AssetType.json,
-        path=str(json_path.relative_to(root_path)),
-        mime_type='application/json',
-        byte_size=json_path.stat().st_size if json_path.exists() else 0,
-        meta={
-            "engine": engine_enum.value,
-            "generated_at": timestamp_iso,
-        },
-    )
-    db.session.add(json_asset)
-
-    colorbar_asset = None
-    if colorbar_bytes:
-        colorbar_asset = Asset(
-            project_id=project.id,
-            type=AssetType.png,
-            path=str(colorbar_path.relative_to(root_path)),
-            mime_type='image/png',
-            byte_size=colorbar_path.stat().st_size if colorbar_path.exists() else 0,
-            meta={
-                "engine": engine_enum.value,
-                "generated_at": timestamp_iso,
-                "label": selected_image.get('label') if selected_image else None,
-            },
-        )
-        db.session.add(colorbar_asset)
-
-    db.session.flush()
 
     tile_metadata = None
     bounds_payload = coverage_payload.get('bounds')
-    if bounds_payload:
+    if bounds_payload and heatmap_asset:
         try:
             min_zoom = None
             max_zoom = None
@@ -4179,19 +4908,39 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
                 extra={'error': str(exc)},
             )
 
-    summary_payload.update({
-        "asset_id": str(heatmap_asset.id),
-        "asset_path": heatmap_asset.path,
-        "json_asset_id": str(json_asset.id),
-        "image_unit": selected_unit,
-    })
+    summary_payload["image_unit"] = selected_unit
     if colorbar_asset:
         summary_payload["colorbar_asset_id"] = str(colorbar_asset.id)
+    if map_snapshot_asset:
+        summary_payload["map_snapshot_asset_id"] = str(map_snapshot_asset.id)
+        summary_payload["map_snapshot_path"] = map_snapshot_asset.path
+        summary_payload["map_snapshot_zoom"] = map_snapshot_zoom
 
+    if ibge_registry:
+        summary_payload.setdefault("ibge_registry", ibge_registry)
     if tile_metadata:
-        summary_payload["tiles"] = _clean_json(tile_metadata)
+        sanitized_tiles = _sanitize_tiles_payload(project, tile_metadata)
+        if sanitized_tiles:
+            summary_payload["tiles"] = _clean_json(sanitized_tiles)
+    updated_settings = dict(project.settings or {})
+    updated_settings.pop('lastCoverage', None)
+    updated_settings['lastCoverage'] = _clean_json(summary_payload)
+    project.settings = updated_settings
 
-    json_path.write_text(json.dumps(summary_payload, ensure_ascii=False, indent=2, default=_json_default))
+    json_blob = json.dumps(summary_payload, ensure_ascii=False, indent=2, default=_json_default).encode('utf-8')
+    json_asset = _create_asset_from_bytes(
+        'coverage',
+        'json',
+        json_blob,
+        AssetType.json,
+        {
+            "engine": engine_enum.value,
+            "generated_at": timestamp_iso,
+            "mime_type": "application/json",
+        },
+    )
+    if json_asset:
+        summary_payload["json_asset_id"] = str(json_asset.id)
 
     job = CoverageJob(
         project_id=project.id,
@@ -4206,66 +4955,45 @@ def _persist_coverage_artifacts(user, project, engine_value, request_payload, co
             "loss_components": _clean_json(coverage_payload.get('loss_components')),
             "summary": _clean_json(summary_payload),
         },
-        outputs_asset_id=heatmap_asset.id,
+        outputs_asset_id=heatmap_asset.id if heatmap_asset else None,
         started_at=timestamp,
         finished_at=timestamp,
     )
     db.session.add(job)
 
-    settings = project.settings or {}
-    updated_settings = dict(settings)
-    last_coverage = {
-        "generated_at": timestamp_iso,
-        "engine": engine_enum.value,
-        "project_slug": project.slug,
-        "asset_id": str(heatmap_asset.id),
-        "asset_path": heatmap_asset.path,
-        "json_asset_id": str(json_asset.id),
-        "radius_km": coverage_payload.get('requested_radius_km'),
-        "center_metrics": _clean_json(coverage_payload.get('center_metrics')),
-        "bounds": _clean_json(coverage_payload.get('bounds')),
-        "scale": _clean_json(coverage_payload.get('scale')),
-        "center": _clean_json(coverage_payload.get('center')),
-        "requested_radius_km": _clean_json(coverage_payload.get('requested_radius_km')),
-        "receivers": _clean_json(receivers_payload),
-        "loss_components": _clean_json(coverage_payload.get('loss_components')),
-        "gain_components": _clean_json(coverage_payload.get('gain_components')),
-        "colorbar_bounds": _clean_json(coverage_payload.get('colorbar_bounds')),
-        "tx_location_name": coverage_payload.get('tx_location_name'),
-        "tx_site_elevation": coverage_payload.get('tx_site_elevation'),
-        "tx_parameters": _clean_json(coverage_payload.get('tx_parameters')),
-    }
-    if ibge_registry:
-        last_coverage["ibge_registry"] = ibge_registry
-    if colorbar_asset:
-        last_coverage["colorbar_asset_id"] = str(colorbar_asset.id)
-    if tile_metadata:
-        last_coverage["tiles"] = _clean_json(tile_metadata)
-    if coverage_payload.get('rt3dScene'):
-        last_coverage["rt3d_scene"] = _clean_json(coverage_payload.get('rt3dScene'))
-    if coverage_payload.get('rt3dDiagnostics'):
-        last_coverage["rt3d_diagnostics"] = _clean_json(coverage_payload.get('rt3dDiagnostics'))
-    if coverage_payload.get('rt3dRays'):
-        last_coverage["rt3d_rays"] = _clean_json(coverage_payload.get('rt3dRays'))
-    if coverage_payload.get('rt3dSettings'):
-        last_coverage["rt3d_settings"] = _clean_json(coverage_payload.get('rt3dSettings'))
-
-    updated_settings['lastCoverage'] = last_coverage
-    project.settings = updated_settings
+    _persist_project_coverage_record(
+        project,
+        summary_payload,
+        heatmap_asset=heatmap_asset,
+        colorbar_asset=colorbar_asset,
+        map_snapshot_asset=map_snapshot_asset,
+        summary_asset=json_asset,
+    )
 
     return {
         "heatmap_asset": heatmap_asset,
         "json_asset": json_asset,
         "colorbar_asset": colorbar_asset,
+        "map_snapshot_asset": map_snapshot_asset,
         "job": job,
         "timestamp": timestamp_iso,
         "tiles": tile_metadata,
     }
 
 
+
 def _latest_coverage_snapshot(project: Project | None):
     if project is None:
         return None
+
+    coverage_record = (
+        ProjectCoverage.query.filter_by(project_id=project.id)
+        .order_by(ProjectCoverage.generated_at.desc().nullslast(), ProjectCoverage.created_at.desc().nullslast())
+        .first()
+    )
+    payload = _serialize_project_coverage(coverage_record)
+    if payload:
+        return payload
 
     job = (
         CoverageJob.query
@@ -4278,12 +5006,13 @@ def _latest_coverage_snapshot(project: Project | None):
         .first()
     )
 
-    settings_snapshot = (project.settings or {}).get('lastCoverage') or {}
+    settings_snapshot = _sanitize_snapshot_assets(project, (project.settings or {}).get('lastCoverage') or {}) or {}
 
     if not job:
         if settings_snapshot:
             snapshot = dict(settings_snapshot)
             snapshot.setdefault('project_slug', project.slug)
+            snapshot.setdefault('receivers', _project_receivers_payload(project))
             return snapshot
         return None
 
@@ -4297,6 +5026,9 @@ def _latest_coverage_snapshot(project: Project | None):
     if job.outputs_asset_id:
         asset = Asset.query.filter_by(id=job.outputs_asset_id, project_id=project.id).first()
 
+    if asset and not _asset_file_exists(asset):
+        asset = None
+
     if not asset:
         return None
 
@@ -4309,6 +5041,7 @@ def _latest_coverage_snapshot(project: Project | None):
         )
     )
     summary['project_slug'] = project.slug
+    summary['receivers'] = summary.get('receivers') or _project_receivers_payload(project)
 
     if summary.get('json_asset_id') is not None:
         summary['json_asset_id'] = str(summary['json_asset_id'])
@@ -4327,10 +5060,95 @@ def _latest_coverage_snapshot(project: Project | None):
     return summary
 
 
+@bp.route('/projects/<slug>/coverage.kml')
+@login_required
+def download_coverage_kml(slug):
+    project = _load_project_for_current_user(slug)
+    snapshot = _latest_coverage_snapshot(project)
+    if not snapshot or not snapshot.get('asset_id'):
+        return jsonify({'error': 'Nenhuma mancha disponível para exportação.'}), 404
+    bounds = _normalize_bounds_payload(snapshot.get('bounds'))
+    if not bounds:
+        return jsonify({'error': 'Cobertura sem limites válidos para gerar KML.'}), 400
+
+    overlay_bytes = _load_asset_bytes(snapshot.get('asset_id'), snapshot.get('asset_path'))
+    overlay_href = None
+    if overlay_bytes:
+        overlay_href = f"data:image/png;base64,{base64.b64encode(overlay_bytes).decode('ascii')}"
+    else:
+        overlay_href = url_for(
+            'projects.asset_preview',
+            slug=project.slug,
+            asset_id=snapshot.get('asset_id'),
+            _external=True,
+        )
+    center_lat, center_lng = _normalize_point_payload(snapshot.get('center') or snapshot.get('tx_location') or {})
+    if center_lat is None or center_lng is None:
+        center_lat = (bounds['north'] + bounds['south']) / 2.0
+        center_lng = (bounds['east'] + bounds['west']) / 2.0
+    receiver_placemarks = []
+    for receiver in snapshot.get('receivers') or []:
+        location = receiver.get('location') or {}
+        lat = _safe_float(receiver.get('lat') or location.get('lat'))
+        lng = _safe_float(receiver.get('lng') or location.get('lng'))
+        if lat is None or lng is None:
+            continue
+        label = html.escape(receiver.get('label') or receiver.get('id') or 'Receptor')
+        details = []
+        for key, display in (('field', 'Campo'), ('elevation', 'Elevação'), ('distance', 'Distância'), ('municipality', 'Município')):
+            value = receiver.get(key)
+            if value:
+                details.append(f"{display}: {value}")
+        description = html.escape(" | ".join(details)) if details else ''
+        receiver_placemarks.append(f"""
+    <Placemark>
+      <name>{label}</name>
+      <description>{description}</description>
+      <Point>
+        <coordinates>{lng:.6f},{lat:.6f},0</coordinates>
+      </Point>
+    </Placemark>""")
+
+    kml_content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>{html.escape(project.name)} — Cobertura</name>
+    <GroundOverlay>
+      <name>Mancha de cobertura</name>
+      <color>B2FFFFFF</color>
+      <Icon>
+        <href>{overlay_href}</href>
+      </Icon>
+      <LatLonBox>
+        <north>{bounds['north']:.6f}</north>
+        <south>{bounds['south']:.6f}</south>
+        <east>{bounds['east']:.6f}</east>
+        <west>{bounds['west']:.6f}</west>
+      </LatLonBox>
+    </GroundOverlay>
+    <Placemark>
+      <name>Transmissor</name>
+      <Point>
+        <coordinates>{center_lng:.6f},{center_lat:.6f},0</coordinates>
+      </Point>
+    </Placemark>
+    {''.join(receiver_placemarks)}
+  </Document>
+</kml>'''
+    filename = f"cobertura_{project.slug}.kml"
+    return Response(
+        kml_content,
+        mimetype='application/vnd.google-earth.kml+xml',
+        headers={
+            'Content-Disposition': f'attachment; filename=\"{filename}\"'
+        },
+    )
+
+
 @bp.route('/relatorios/<slug>')
 @login_required
 def report_editor(slug):
-    project = project_by_slug_or_404(slug, current_user.uuid)
+    project = _load_project_for_current_user(slug)
     snapshot = _latest_coverage_snapshot(project)
     if snapshot is None:
         flash('Gere uma cobertura antes de montar o relatório.', 'warning')
@@ -4344,22 +5162,24 @@ def report_editor(slug):
 @bp.route('/projects/<slug>/rt3d-scene.geojson')
 @login_required
 def download_rt3d_scene(slug):
-    project = project_by_slug_or_404(slug, current_user.uuid)
+    project = _load_project_for_current_user(slug)
     snapshot = _latest_coverage_snapshot(project) or {}
     scene_meta = snapshot.get('rt3d_scene') or {}
-    asset_path = scene_meta.get('asset_path')
-    if not asset_path:
+    blob = _load_asset_bytes(scene_meta.get('asset_id'), scene_meta.get('asset_path'))
+    if not blob:
         return jsonify({'error': 'Nenhuma cena RT3D disponível para este projeto.'}), 404
-    full_path = storage_root() / asset_path
-    if not full_path.exists():
-        return jsonify({'error': 'Arquivo de cena RT3D não encontrado.'}), 404
-    return send_file(full_path, mimetype='application/geo+json', as_attachment=False)
+    return send_file(
+        io.BytesIO(blob),
+        mimetype='application/geo+json',
+        as_attachment=False,
+        download_name=f"{project.slug}_rt3d.geojson",
+    )
 
 
 @bp.route('/projects/<slug>/rt3d-data')
 @login_required
 def rt3d_data(slug):
-    project = project_by_slug_or_404(slug, current_user.uuid)
+    project = _load_project_for_current_user(slug)
     snapshot = _latest_coverage_snapshot(project) or {}
     if not snapshot.get('rt3d_scene'):
         return jsonify({'error': 'Nenhuma cena RT3D disponível para este projeto.'}), 404
@@ -4384,7 +5204,7 @@ def rt3d_viewer():
     if not slug:
         flash('Selecione um projeto para visualizar em 3D.', 'warning')
         return redirect(url_for('ui.calcular_cobertura'))
-    project = project_by_slug_or_404(slug, current_user.uuid)
+    project = _load_project_for_current_user(slug)
     snapshot = _latest_coverage_snapshot(project)
     if not snapshot or not snapshot.get('rt3d_scene'):
         flash('Este projeto ainda não possui cena RT3D.', 'warning')
@@ -4566,7 +5386,8 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None, dem_direct
     Gtx_peak_dBi = tx.antenna_gain or 0.0
 
     # ganho da RX [dBi]
-    Grx_dBi = tx.rx_gain or 0.0
+    # Em estudos ponto-área assumimos receptor isotrópico (0 dBi)
+    Grx_dBi = 0.0
 
     # override de centro vindo do front (posição "real"/visível da TX)
     center_override = data.get('customCenter') or {}
@@ -4596,7 +5417,8 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None, dem_direct
     frequency = (freq_mhz / 1000.0) * u.GHz  # pycraf usa GHz
 
     # alturas TX / RX acima do solo
-    rx_height_m = tx.rx_height if tx.rx_height is not None else 1.0
+    # Para ponto-área fixamos a altura do receptor em 2 m
+    rx_height_m = 2.0
     tx_height_m = tx.tower_height if tx.tower_height is not None else 30.0
     h_rx = rx_height_m * u.m
     h_tx = tx_height_m * u.m
@@ -5151,7 +5973,7 @@ def _compute_coverage_map(tx, data, include_arrays=False, label=None, dem_direct
         "tx_parameters": {
             "power_w": getattr(tx, 'transmission_power', None),
             "tower_height_m": getattr(tx, 'tower_height', None),
-            "rx_height_m": getattr(tx, 'rx_height', None),
+            "rx_height_m": rx_height_m,
             "total_loss_db": getattr(tx, 'total_loss', None),
             "antenna_gain_dbi": getattr(tx, 'antenna_gain', None),
         },
@@ -5188,7 +6010,7 @@ def calculate_coverage():
     project_slug = data.get('projectSlug') or data.get('project_slug')
     project = None
     if project_slug:
-        project = project_by_slug_or_404(project_slug, current_user.uuid)
+        project = _load_project_for_current_user(project_slug)
 
     engine_value = data.get('coverageEngine') or CoverageEngine.p1546.value
     if engine_value not in {engine.value for engine in CoverageEngine}:
@@ -5407,7 +6229,9 @@ def calculate_coverage():
             result['coverage_job_id'] = str(persisted['job'].id)
             result['generated_at'] = persisted['timestamp']
             if persisted.get('tiles'):
-                result['tiles'] = persisted['tiles']
+                sanitized_tiles = _sanitize_tiles_payload(project, persisted['tiles'])
+                if sanitized_tiles:
+                    result['tiles'] = sanitized_tiles
             if project:
                 result['project_slug'] = project.slug
                 result['lastCoverage'] = _latest_coverage_snapshot(project)
@@ -5418,7 +6242,9 @@ def calculate_coverage():
         last_cov = result.get('lastCoverage') or {}
         tiles_meta = last_cov.get('tiles')
         if tiles_meta:
-            result['tiles'] = tiles_meta
+            sanitized_tiles = _sanitize_tiles_payload(project, tiles_meta) if project else None
+            if sanitized_tiles:
+                result['tiles'] = sanitized_tiles
 
     return jsonify(result)
 
@@ -5439,7 +6265,7 @@ def atualizar_localizacao_tx():
     project = None
     if project_slug:
         try:
-            project = project_by_slug_or_404(project_slug, current_user.uuid)
+            project = _load_project_for_current_user(project_slug)
         except NotFound:
             project = None
 
@@ -5486,18 +6312,53 @@ def atualizar_localizacao_tx():
 @bp.route('/projects/<slug>/receivers/<receiver_id>', methods=['DELETE'])
 @login_required
 def delete_project_receiver(slug, receiver_id):
-    project = project_by_slug_or_404(slug, current_user.uuid)
+    project = _load_project_for_current_user(slug)
+    record = ProjectReceiver.query.filter_by(
+        project_id=project.id,
+        legacy_id=str(receiver_id),
+    ).first()
     settings = dict(project.settings or {})
-    bookmarks = settings.get('receiverBookmarks') or []
-    filtered = [entry for entry in bookmarks if str(entry.get('id')) != str(receiver_id)]
-    settings['receiverBookmarks'] = filtered
-    project.settings = settings
+    if record:
+        _delete_receiver_profile_assets(project, record.summary or {})
+        db.session.delete(record)
+    remaining = ProjectReceiver.query.filter_by(project_id=project.id).count()
+    if remaining == 0:
+        ProjectCoverage.query.filter_by(project_id=project.id).delete()
+        _purge_project_asset_folders(project, ('profiles', 'coverage'))
+        settings.pop('receiverBookmarks', None)
+        settings.pop('lastCoverage', None)
+    else:
+        settings['receiverBookmarks'] = _project_receivers_payload(project, include_urls=True)
+    project.settings = settings or None
     try:
         db.session.commit()
     except SQLAlchemyError as exc:
         db.session.rollback()
         return jsonify({'error': str(exc)}), 500
-    return jsonify({'removed': receiver_id, 'count': len(filtered)}), 200
+    return jsonify({'removed': receiver_id, 'count': remaining}), 200
+
+
+@bp.route('/projects/<slug>/receivers', methods=['DELETE'])
+@login_required
+def clear_project_receivers(slug):
+    project = _load_project_for_current_user(slug)
+    records = ProjectReceiver.query.filter_by(project_id=project.id).all()
+    cleared = len(records)
+    for record in records:
+        _delete_receiver_profile_assets(project, record.summary or {})
+        db.session.delete(record)
+    ProjectCoverage.query.filter_by(project_id=project.id).delete()
+    settings = dict(project.settings or {})
+    settings.pop('receiverBookmarks', None)
+    settings.pop('lastCoverage', None)
+    project.settings = settings
+    _purge_project_asset_folders(project, ('profiles', 'coverage'))
+    try:
+        db.session.commit()
+    except SQLAlchemyError as exc:
+        db.session.rollback()
+        return jsonify({'error': str(exc)}), 500
+    return jsonify({'cleared': cleared, 'coverage_cleared': True}), 200
 
 @bp.route('/clima-recomendado', methods=['GET'])
 @login_required
@@ -5675,10 +6536,8 @@ def carregar_dados():
         project = None
         project_settings = {}
         if project_slug:
-            project = project_by_slug_or_404(project_slug, current_user.uuid)
-            project_settings = dict(project.settings or {})
-        else:
-            project_settings = {}
+            project = _load_project_for_current_user(project_slug)
+            project_settings = _project_settings_with_dynamic(project)
 
         latest_snapshot = _latest_coverage_snapshot(project) if project else None
 

@@ -1,6 +1,6 @@
 {% extends "layouts/base.html" %}
 
-{% set project_settings = project.settings or {} %}
+{% set project_settings = project_settings if project_settings is defined else (project.settings or {}) %}
 {% set last_coverage = project_settings.get('lastCoverage') if project_settings else {} %}
 
 {% block title %}{{ project.name }} · Projetos · ATX Coverage{% endblock %}
@@ -73,13 +73,14 @@
                     </dl>
                 </div>
             </div>
-            {% if last_coverage and last_coverage.asset_id %}
+            {% set coverage_asset_id = last_coverage.get('asset_id') if last_coverage else None %}
+            {% if coverage_asset_id %}
             <div class="card shadow-sm mt-4">
                 <div class="card-body">
                     <h5 class="card-title mb-3">Última cobertura</h5>
                     <div class="d-flex gap-3 flex-column flex-md-row">
                         <div class="flex-shrink-0" style="max-width: 220px;">
-                            <img src="{{ url_for('projects.asset_preview', slug=project.slug, asset_id=last_coverage['asset_id']) }}" alt="Prévia da cobertura" class="img-fluid rounded">
+                            <img src="{{ url_for('projects.asset_preview', slug=project.slug, asset_id=coverage_asset_id) }}" alt="Prévia da cobertura" class="img-fluid rounded">
                         </div>
                         <div class="small text-muted flex-grow-1">
                             <p class="mb-1"><strong>Gerada em:</strong> {{ last_coverage['generated_at'] }}</p>
@@ -89,9 +90,15 @@
                             {% if center_metrics %}
                                 <p class="mb-1"><strong>Perda combinada:</strong> {{ center_metrics.combined_loss_center_db|round(2) if center_metrics.combined_loss_center_db is not none else '—' }} dB</p>
                             {% endif %}
-                            <a class="btn btn-sm btn-outline-primary mt-2" href="{{ url_for('projects.asset_preview', slug=project.slug, asset_id=last_coverage['asset_id']) }}" target="_blank">Ver imagem em nova aba</a>
+                            <a class="btn btn-sm btn-outline-primary mt-2" href="{{ url_for('projects.asset_preview', slug=project.slug, asset_id=coverage_asset_id) }}" target="_blank">Ver imagem em nova aba</a>
                         </div>
                     </div>
+                </div>
+            </div>
+            {% elif last_coverage %}
+            <div class="card shadow-sm mt-4">
+                <div class="card-body text-muted small">
+                    <strong>Última cobertura:</strong> Prévia indisponível (artefatos removidos).
                 </div>
             </div>
             {% endif %}

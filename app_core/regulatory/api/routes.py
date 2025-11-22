@@ -1,13 +1,14 @@
 from __future__ import annotations
 
-from pathlib import Path
+import io
 
 from flask import jsonify, request, send_file, url_for
 from flask_login import login_required, current_user
 
 from extensions import db
 from app_core.utils import project_by_slug_or_404
-from app_core.storage import storage_root
+from app_core.models import Asset
+from app_core.storage_utils import rehydrate_asset_data
 
 from ..models import RegulatoryReport, RegulatoryReportStatus
 from ..service import generate_regulatory_report
@@ -46,8 +47,16 @@ def download_pdf(report_id):
         return jsonify({'error': 'Não autorizado.'}), 403
     if not report.output_pdf_path:
         return jsonify({'error': 'Relatório ainda não gerado.'}), 404
-    path = storage_root() / report.output_pdf_path
-    return send_file(path, as_attachment=True, download_name=Path(path).name)
+    blob = _resolve_report_blob(report, report.output_pdf_path)
+    if not blob:
+        return jsonify({'error': 'Arquivo indisponível.'}), 404
+    data, filename = blob
+    return send_file(
+        io.BytesIO(data),
+        as_attachment=True,
+        download_name=filename or f"{report.slug}.pdf",
+        mimetype='application/pdf',
+    )
 
 
 @bp.route('/reports/<report_id>/download/bundle', methods=['GET'])
@@ -58,8 +67,16 @@ def download_bundle(report_id):
         return jsonify({'error': 'Não autorizado.'}), 403
     if not report.output_zip_path:
         return jsonify({'error': 'Pacote ainda não gerado.'}), 404
-    path = storage_root() / report.output_zip_path
-    return send_file(path, as_attachment=True, download_name='mosaico_submit.zip')
+    blob = _resolve_report_blob(report, report.output_zip_path)
+    if not blob:
+        return jsonify({'error': 'Pacote indisponível.'}), 404
+    data, filename = blob
+    return send_file(
+        io.BytesIO(data),
+        as_attachment=True,
+        download_name=filename or 'mosaico_submit.zip',
+        mimetype='application/zip',
+    )
 
 
 @bp.route('/projects/<slug>/basic-form', methods=['GET'])
@@ -86,3 +103,16 @@ def _serialize_report(report: RegulatoryReport) -> dict:
             'bundle': bundle_url,
         },
     }
+
+
+def _resolve_report_blob(report: RegulatoryReport, path_value: str | None) -> tuple[bytes, str | None] | None:
+    if not path_value:
+        return None
+    asset = Asset.query.filter_by(project_id=report.project_id, path=path_value).first()
+    if asset:
+        payload = asset.data or rehydrate_asset_data(asset)
+        if payload:
+            filename = (asset.meta or {}).get('name') or path_value.rsplit('/', 1)[-1]
+            blob = payload if isinstance(payload, (bytes, bytearray)) else bytes(payload)
+            return blob, filename
+    return None

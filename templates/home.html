@@ -110,23 +110,30 @@
         <section class="row g-4 mb-4">
             <div class="col-lg-8">
                 <div class="home-card coverage-card h-100">
-                    <div class="d-flex justify-content-between align-items-center mb-3">
+                    {% set preview_url = coverage_artifacts.map_snapshot_url or coverage_artifacts.heatmap_url %}
+                    <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
                         <div>
                             <h5 class="mb-1">Última mancha gerada</h5>
-                            <p class="text-muted small mb-0">Pré-visualização do raster utilizado no mapa de cobertura.</p>
+                            <p class="text-muted small mb-0">Pré-visualização do raster sobre o mapa operacional.</p>
                         </div>
-                        <div class="d-flex gap-2">
-                            {% if coverage_artifacts.heatmap_url %}
-                                <a class="btn btn-sm btn-outline-secondary" href="{{ coverage_artifacts.heatmap_url }}" target="_blank">Abrir imagem</a>
+                        <div class="d-flex gap-2 flex-wrap">
+                            {% if preview_url %}
+                                <a class="btn btn-sm btn-outline-secondary" href="{{ preview_url }}" target="_blank" rel="noopener">Abrir imagem</a>
+                            {% endif %}
+                            {% if coverage_artifacts.map_snapshot_url and coverage_artifacts.heatmap_url and coverage_artifacts.map_snapshot_url != coverage_artifacts.heatmap_url %}
+                                <a class="btn btn-sm btn-outline-secondary" href="{{ coverage_artifacts.heatmap_url }}" target="_blank" rel="noopener">Heatmap bruto</a>
+                            {% endif %}
+                            {% if coverage_artifacts.kml_url %}
+                                <a class="btn btn-sm btn-outline-success" href="{{ coverage_artifacts.kml_url }}" target="_blank" rel="noopener">Exportar KML</a>
                             {% endif %}
                             {% if coverage_artifacts.rt3d_viewer_url %}
                                 <a class="btn btn-sm btn-outline-primary" href="{{ coverage_artifacts.rt3d_viewer_url }}">Visualizar em 3D</a>
                             {% endif %}
                         </div>
                     </div>
-                    {% if coverage_artifacts.heatmap_url %}
+                    {% if preview_url %}
                         <div class="coverage-preview mb-3">
-                            <img src="{{ coverage_artifacts.heatmap_url }}" alt="Prévia da cobertura" class="img-fluid rounded-3 w-100">
+                            <img src="{{ preview_url }}" alt="Prévia da cobertura" class="img-fluid rounded-3 w-100">
                         </div>
                     {% else %}
                         <div class="empty-tile text-center p-5 text-muted border rounded-3">
@@ -161,7 +168,15 @@
                         <div class="col-6 col-md-3">
                             <span class="stat-label">Artefatos</span>
                             <strong>
-                                {{ 'RT3D + Heatmap' if coverage_artifacts.rt3d_viewer_url else 'Raster 2D' if coverage_artifacts.heatmap_url else '—' }}
+                                {% if coverage_artifacts.map_snapshot_url and coverage_artifacts.rt3d_viewer_url %}
+                                    Mapa composto + RT3D
+                                {% elif coverage_artifacts.map_snapshot_url %}
+                                    Mapa composto
+                                {% elif coverage_artifacts.heatmap_url %}
+                                    Heatmap bruto
+                                {% else %}
+                                    —
+                                {% endif %}
                             </strong>
                         </div>
                     </div>
@@ -259,10 +274,17 @@
                         <a class="btn btn-sm btn-outline-secondary" href="{{ url_for('ui.download_report') }}">Baixar relatório</a>
                     </div>
                     <div class="artifact-grid">
-                        {% if coverage_artifacts.heatmap_url %}
+                        {% set artifact_preview_url = coverage_artifacts.map_snapshot_url or coverage_artifacts.heatmap_url %}
+                        {% if artifact_preview_url %}
                             <figure class="artifact-tile">
-                                <img src="{{ coverage_artifacts.heatmap_url }}" alt="Cobertura" class="img-fluid">
-                                <figcaption>Mancha de cobertura</figcaption>
+                                <img src="{{ artifact_preview_url }}" alt="Cobertura" class="img-fluid">
+                                <figcaption>{{ 'Mapa composto' if coverage_artifacts.map_snapshot_url else 'Heatmap bruto' }}</figcaption>
+                            </figure>
+                        {% endif %}
+                        {% if coverage_artifacts.map_snapshot_url and coverage_artifacts.heatmap_url %}
+                            <figure class="artifact-tile">
+                                <img src="{{ coverage_artifacts.heatmap_url }}" alt="Heatmap" class="img-fluid">
+                                <figcaption>Heatmap bruto</figcaption>
                             </figure>
                         {% endif %}
                         {% if coverage_artifacts.colorbar_url %}
@@ -295,7 +317,7 @@
                                 <figcaption>Registro legado</figcaption>
                             </figure>
                         {% endif %}
-                        {% if not (coverage_artifacts.heatmap_url or coverage_artifacts.colorbar_url or image_gallery.profile or image_gallery.diagram_h or image_gallery.diagram_v or image_gallery.legacy_coverage) %}
+                        {% if not (coverage_artifacts.map_snapshot_url or coverage_artifacts.heatmap_url or coverage_artifacts.colorbar_url or image_gallery.profile or image_gallery.diagram_h or image_gallery.diagram_v or image_gallery.legacy_coverage) %}
                             <div class="empty-tile text-center p-5 text-muted border rounded-3">
                                 Artefatos visuais serão exibidos aqui após a primeira execução.
                             </div>

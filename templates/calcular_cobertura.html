@@ -91,8 +91,13 @@
         <article class="coverage-card mb-4">
             <div class="d-flex flex-column flex-md-row gap-3">
                 <div class="flex-shrink-0" style="max-width: 260px;">
-                    <img src="{{ url_for('projects.asset_preview', slug=project.slug, asset_id=last_coverage['asset_id']) }}"
+                    {% set coverage_asset_id = last_coverage.get('asset_id') %}
+                    {% if coverage_asset_id %}
+                    <img src="{{ url_for('projects.asset_preview', slug=project.slug, asset_id=coverage_asset_id) }}"
                          alt="Pré-visualização da cobertura" class="img-fluid rounded shadow-sm">
+                    {% else %}
+                    <div class="text-muted small">Prévia indisponível.</div>
+                    {% endif %}
                 </div>
                 <div class="flex-grow-1">
                     <h3 class="mb-3">Última cobertura gerada</h3>
@@ -335,10 +340,6 @@
                         <div>
                             <label for="antennaGain" class="form-label">Ganho da antena (dBd)</label>
                             <input type="number" id="antennaGain" name="antennaGain" class="form-control" min="0" step="any" required>
-                        </div>
-                        <div>
-                            <label for="rxGain" class="form-label">Ganho do receptor (dB)</label>
-                            <input type="number" id="rxGain" name="rxGain" class="form-control" min="0" step="any" required>
                         </div>
                         <div>
                             <label for="antennaTilt" class="form-label">Tilt elétrico TX (°)</label>

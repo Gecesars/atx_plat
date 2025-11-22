@@ -4,8 +4,12 @@ import io
 import json
 import math
 from functools import lru_cache
-from pathlib import Path
+from uuid import UUID
 
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
 from flask import (
     Blueprint,
     abort,
@@ -22,8 +26,9 @@ from sqlalchemy.exc import SQLAlchemyError
 from PIL import Image
 
 from extensions import db
-from app_core.models import Project, Asset, AssetType, CoverageJob, Report, DatasetSource
-from app_core.storage import ensure_storage_structure, remove_project_storage, storage_root
+from app_core.models import Project, Asset, AssetType, CoverageJob, ProjectCoverage, ProjectReceiver, Report, DatasetSource
+from app_core.storage import inline_asset_path
+from app_core.storage_utils import rehydrate_asset_data
 from app_core.utils import (
     ensure_unique_slug,
     project_by_slug_or_404,
@@ -33,6 +38,7 @@ from app_core.utils import (
 )
 from app_core.data_acquisition import download_srtm_tile, download_mapbiomas_tile
 from app_core.models import CoverageEngine
+from app_core.routes.ui import _project_settings_with_dynamic, _latest_coverage_snapshot
 
 
 bp = Blueprint("projects", __name__, url_prefix="/projects")
@@ -52,7 +58,10 @@ def list_projects():
         if hasattr(current_user, "projects")
         else []
     )
-    return render_template("projects/index.html", projects=projects)
+    project_settings_map = {}
+    for project in projects:
+        project_settings_map[project.id] = _project_settings_with_dynamic(project)
+    return render_template("projects/index.html", projects=projects, project_settings_map=project_settings_map)
 
 
 @bp.route("/new", methods=["GET", "POST"])
@@ -93,7 +102,6 @@ def new_project():
                 db.session.rollback()
                 error = f"Erro ao criar projeto: {exc}"
             else:
-                ensure_storage_structure(str(current_user.uuid), slug)
                 flash("Projeto criado com sucesso!", "success")
                 return redirect(url_for("projects.view_project", slug=slug))
 
@@ -115,6 +123,7 @@ def view_project(slug):
         jobs=jobs,
         reports=reports,
         dataset_sources=dataset_sources,
+        project_settings=_project_settings_with_dynamic(project),
     )
 
 
@@ -123,12 +132,18 @@ def view_project(slug):
 def asset_preview(slug, asset_id):
     project = project_by_slug_or_404(slug, current_user.uuid)
     asset = Asset.query.filter_by(id=asset_id, project_id=project.id).first()
-    if asset is None:
+    blob = _asset_bytes(asset)
+    if asset is None or not blob:
         abort(404)
-    file_path = storage_root() / asset.path
-    if not file_path.exists():
-        abort(404)
-    return send_file(file_path, mimetype=asset.mime_type or 'application/octet-stream')
+    stream = io.BytesIO(blob)
+    download_name = (asset.meta or {}).get('name')
+    if not download_name and asset.path:
+        download_name = asset.path.rsplit('/', 1)[-1]
+    return send_file(
+        stream,
+        mimetype=asset.mime_type or 'application/octet-stream',
+        download_name=download_name,
+    )
 
 
 TILE_SIZE = 256
@@ -141,28 +156,150 @@ def _empty_tile_bytes() -> bytes:
     return buffer.getvalue()
 
 
-@lru_cache(maxsize=128)
-def _load_heatmap_bytes(path_str: str) -> bytes:
-    return Path(path_str).read_bytes()
+def _receiver_summary_from_coverages(asset: Asset) -> dict | None:
+    if not asset or not asset.project_id:
+        return None
+    coverage_records = (
+        ProjectCoverage.query.filter_by(project_id=asset.project_id)
+        .order_by(
+            ProjectCoverage.generated_at.desc().nullslast(),
+            ProjectCoverage.created_at.desc().nullslast(),
+        )
+        .all()
+    )
+    asset_id_text = str(asset.id)
+    for record in coverage_records:
+        payload = record.payload or {}
+        receivers = payload.get('receivers') or []
+        for entry in receivers:
+            if entry.get('profile_asset_id') == asset_id_text:
+                return entry
+    return None
 
 
-@lru_cache(maxsize=128)
-def _load_summary_payload(path_str: str) -> dict:
-    with open(path_str, 'r', encoding='utf-8') as handle:
-        return json.load(handle)
+def _is_valid_uuid(value) -> bool:
+    try:
+        UUID(str(value))
+        return True
+    except (ValueError, TypeError):
+        return False
 
 
-def _resolve_summary_path(image_path: Path):
-    if image_path.name.endswith('_field.png'):
-        candidate = image_path.with_name(image_path.name.replace('_field.png', '_summary.json'))
-        if candidate.exists():
-            return candidate
-    candidate = image_path.with_suffix('.json')
-    if candidate.exists():
-        return candidate
-    stem = image_path.stem.replace('_field', '')
-    for option in image_path.parent.glob(f"{stem}*_summary.json"):
-        return option
+def _regenerate_receiver_profile_asset(asset: Asset | None) -> bytes | None:
+    if not asset:
+        return None
+    record = ProjectReceiver.query.filter_by(profile_asset_id=str(asset.id)).first()
+    if record:
+        summary = record.summary or {}
+    else:
+        summary = _receiver_summary_from_coverages(asset) or {}
+    if not summary:
+        return None
+    profile = summary.get('profile') or {}
+    elevations = profile.get('elevations_m')
+    if not elevations:
+        return None
+    try:
+        elevation_array = np.asarray(elevations, dtype=float)
+    except (TypeError, ValueError):
+        return None
+    if elevation_array.size == 0:
+        return None
+    distance_km = profile.get('distance_km') or summary.get('distance_km')
+    try:
+        distance_km = float(distance_km)
+    except (TypeError, ValueError):
+        distance_km = None
+    if not distance_km or not np.isfinite(distance_km) or distance_km <= 0:
+        distance_km = max(float(elevation_array.size) * 0.05, 1.0)
+    distances = np.linspace(0.0, distance_km, elevation_array.size)
+
+    receiver_label = None
+    if record:
+        receiver_label = record.label or record.legacy_id
+    else:
+        receiver_label = summary.get('label') or summary.get('id')
+    if not receiver_label:
+        receiver_label = 'Perfil RX'
+
+    fig, ax = plt.subplots(figsize=(8.0, 3.0))
+    ax.plot(distances, elevation_array, color='#0d47a1', linewidth=1.5)
+    ax.fill_between(distances, elevation_array, elevation_array.min(), color='#bbdefb', alpha=0.4)
+    ax.set_xlabel('Distância (km)')
+    ax.set_ylabel('Elevação (m)')
+    ax.grid(True, alpha=0.3, linestyle='--')
+    ax.set_title(receiver_label, fontsize=11)
+
+    info_lines = []
+    if summary.get('distance'):
+        info_lines.append(f"Distância: {summary['distance']}")
+    elif distance_km:
+        info_lines.append(f"Distância: {distance_km:.2f} km")
+    if summary.get('field'):
+        info_lines.append(f"Campo: {summary['field']}")
+    if summary.get('bearing'):
+        info_lines.append(f"Azimute: {summary['bearing']}")
+    if summary.get('elevation'):
+        info_lines.append(f"Elevação RX: {summary['elevation']}")
+    fig.text(
+        0.02,
+        0.92,
+        "\n".join(info_lines[:4]),
+        fontsize=8,
+        ha='left',
+        va='top',
+    )
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format='png', bbox_inches='tight', dpi=110)
+    buffer.seek(0)
+    blob = buffer.read()
+    buffer.close()
+    plt.close(fig)
+
+    asset.data = blob
+    asset.byte_size = len(blob)
+    asset.path = inline_asset_path('profiles', 'png')
+    meta = dict(asset.meta or {})
+    meta['regenerated'] = True
+    asset.meta = meta
+    db.session.add(asset)
+    db.session.commit()
+    return blob
+
+
+def _asset_bytes(asset: Asset | None) -> bytes | None:
+    if not asset:
+        return None
+    if asset.data:
+        return bytes(asset.data)
+    payload = rehydrate_asset_data(asset)
+    if payload:
+        return payload
+    if (asset.meta or {}).get('kind') == 'receiver_profile':
+        return _regenerate_receiver_profile_asset(asset)
+    return None
+
+
+def _coverage_summary_for(asset: Asset, project_id) -> dict | None:
+    heatmap_id = str(asset.id) if asset and getattr(asset, "id", None) else None
+    if not heatmap_id:
+        return None
+    record = (
+        ProjectCoverage.query.filter_by(project_id=project_id, heatmap_asset_id=heatmap_id)
+        .order_by(ProjectCoverage.generated_at.desc().nullslast(), ProjectCoverage.created_at.desc().nullslast())
+        .first()
+    )
+    if record and record.payload:
+        return dict(record.payload)
+    if record and record.summary_asset_id:
+        summary_asset = Asset.query.filter_by(id=record.summary_asset_id, project_id=project_id).first()
+        blob = _asset_bytes(summary_asset)
+        if blob:
+            try:
+                return json.loads(blob.decode('utf-8'))
+            except json.JSONDecodeError:
+                return None
     return None
 
 
@@ -289,6 +426,8 @@ def _tile_response(tile_bytes: bytes):
 def coverage_tile(slug, asset_id, z, x, y):
     if z < 0 or z > 22:
         abort(404)
+    if not _is_valid_uuid(asset_id):
+        abort(404)
 
     project = project_by_slug_or_404(slug, current_user.uuid)
     asset = (
@@ -302,8 +441,8 @@ def coverage_tile(slug, asset_id, z, x, y):
     if asset is None:
         abort(404)
 
-    image_path = storage_root() / asset.path
-    if not image_path.exists():
+    image_bytes = _asset_bytes(asset)
+    if not image_bytes:
         abort(404)
 
     scale = 1 << z
@@ -311,18 +450,11 @@ def coverage_tile(slug, asset_id, z, x, y):
     if y < 0 or y >= scale:
         return _tile_response(_empty_tile_bytes())
 
-    summary_path = _resolve_summary_path(image_path)
-    coverage_bounds = None
-    if summary_path and summary_path.exists():
-        try:
-            summary_payload = _load_summary_payload(str(summary_path))
-            coverage_bounds = summary_payload.get('bounds')
-        except (OSError, json.JSONDecodeError):
-            coverage_bounds = None
+    summary_payload = _coverage_summary_for(asset, project.id)
+    coverage_bounds = (summary_payload or {}).get('bounds')
 
     tile_bounds = _tile_bounds(z, wrapped_x, y)
     try:
-        image_bytes = _load_heatmap_bytes(str(image_path))
         tile_bytes = _compose_tile_bytes(image_bytes, coverage_bounds, tile_bounds)
     except OSError:
         tile_bytes = _empty_tile_bytes()
@@ -368,7 +500,6 @@ def update_project(slug):
         db.session.rollback()
         flash(f"Erro ao atualizar projeto: {exc}", "error")
     else:
-        ensure_storage_structure(str(project.user_uuid), project.slug)
         flash("Projeto atualizado com sucesso!", "success")
     return redirect(url_for("projects.view_project", slug=project.slug))
 
@@ -377,7 +508,6 @@ def update_project(slug):
 @login_required
 def delete_project(slug):
     project = project_by_slug_or_404(slug, current_user.uuid)
-    remove_project_storage(str(project.user_uuid), project.slug)
     db.session.delete(project)
     try:
         db.session.commit()
@@ -435,7 +565,6 @@ def api_create_project():
         db.session.rollback()
         return jsonify({"error": f"Não foi possível criar o projeto: {exc}"}), 500
 
-    ensure_storage_structure(str(current_user.uuid), slug)
     response = jsonify({"project": project_to_dict(project)})
     response.status_code = 201
     response.headers["Location"] = url_for("projects_api.api_get_project", slug=slug)
@@ -537,7 +666,6 @@ def api_update_project(slug):
         db.session.rollback()
         return jsonify({"error": f"Não foi possível atualizar o projeto: {exc}"}), 500
 
-    ensure_storage_structure(str(project.user_uuid), project.slug)
     return jsonify({"project": project_to_dict(project)})
 
 

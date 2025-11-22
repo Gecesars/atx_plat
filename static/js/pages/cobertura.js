@@ -330,7 +330,6 @@
             setFieldValue('transmissionPower', data.transmissionPower);
             const displayGain = dbiToDbd(data.antennaGain);
             setFieldValue('antennaGain', displayGain !== null ? displayGain : data.antennaGain);
-            setFieldValue('rxGain', data.rxGain);
             setFieldValue('antennaTilt', data.antennaTilt);
             setFieldValue('antennaDirection', data.antennaDirection);
             setFieldValue('temperature', data.temperature);
@@ -410,7 +409,6 @@
             frequency: parseNumber(document.getElementById('frequency')?.value),
             transmissionPower: parseNumber(document.getElementById('transmissionPower')?.value),
             antennaGain: gainInput !== null ? dbdToDbi(gainInput) : null,
-            rxGain: parseNumber(document.getElementById('rxGain')?.value),
             antennaTilt: parseNumber(document.getElementById('antennaTilt')?.value),
             antennaDirection: parseNumber(document.getElementById('antennaDirection')?.value),
             towerHeight: parseNumber(document.getElementById('towerHeight')?.value),

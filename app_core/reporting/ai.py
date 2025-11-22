@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import google.generativeai as genai
 from flask import current_app
@@ -81,14 +81,51 @@ As imagens (mancha, perfil e diagramas) serão fornecidas como anexos inline; us
 """
 
 
-_JSON_BLOCK_RE = re.compile(r"\{.*\}", re.S)
+_JSON_BLOCK_RE = re.compile(r"(\{.*\}|\[.*\])", re.S)
+
+
+VALIDATION_PROMPT = """Você é um auditor técnico. Verifique se os textos do relatório estão coerentes com os dados oficiais.
+Sempre explique o motivo da inconsistência usando valores objetivos (ERP, HAAT, distâncias, campo mínimo, etc.).
+
+Projeto: {project_name} ({project_slug})
+Serviço / Classe: {service} / {service_class}
+Localização: {location}
+Raio alvo: {radius_km} km
+ERP (dBm): {erp_dbm}
+HAAT médio: {haat_average_m} m
+Notas: {project_notes}
+
+JSON de métricas:
+{metrics_json}
+
+Resumo de receptores:
+{link_summary}
+
+JSON de receptores:
+{links_json}
+
+Seções atuais do relatório (JSON):
+{sections_json}
+
+Analise cada campo e responda EXCLUSIVAMENTE com uma lista JSON:
+[
+  {{
+    "field": "coverage",
+    "issue": "Descrição clara do problema",
+    "severity": "error" | "warning",
+    "corrected_text": "Texto substituto válido (sem citar IA)",
+    "evidence": "Trecho explicando quais números justificam a correção"
+  }}
+]
+Se não houver problemas, retorne [].
+"""
 
 
 def _extract_json_text(raw_text: str) -> str:
     raw_text = (raw_text or "").strip()
     if not raw_text:
         raise AISummaryError("Resposta vazia do modelo Gemini.")
-    fence_match = re.search(r"```json\s*(\{.*?\})\s*```", raw_text, re.S | re.I)
+    fence_match = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", raw_text, re.S | re.I)
     if fence_match:
         return fence_match.group(1)
     match = _JSON_BLOCK_RE.search(raw_text)
@@ -195,3 +232,78 @@ def build_ai_summary(
             normalized_links.append({"label": str(label), "analysis": str(analysis)})
     summary["link_analyses"] = normalized_links
     return summary
+
+
+def validate_ai_sections(
+    project,
+    snapshot: Dict[str, Any],
+    metrics: Dict[str, Any],
+    ai_sections: Dict[str, Any],
+    link_summary: str,
+    links_payload: list[Dict[str, Any]] | None = None,
+) -> List[Dict[str, Any]]:
+    api_key = current_app.config.get("GEMINI_API_KEY")
+    if not api_key:
+        raise AIUnavailable("GEMINI_API_KEY não configurada.")
+    model_name = current_app.config.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    metrics_payload = {
+        "service": metrics.get("service"),
+        "service_class": metrics.get("service_class"),
+        "erp_dbm": metrics.get("erp_dbm"),
+        "haat_average_m": metrics.get("haat_average_m"),
+        "radius_km": metrics.get("radius_km"),
+        "frequency_mhz": metrics.get("frequency_mhz"),
+        "polarization": metrics.get("polarization"),
+        "losses_db": metrics.get("losses_db"),
+        "tx_power_w": metrics.get("tx_power_w"),
+        "location": metrics.get("location") or snapshot.get("tx_location_name"),
+    }
+    metrics_json = json.dumps(metrics_payload, ensure_ascii=False, indent=2)
+    sections_json = json.dumps(ai_sections or {}, ensure_ascii=False, indent=2)
+    links_json = json.dumps(links_payload or [], ensure_ascii=False, indent=2)
+
+    prompt = VALIDATION_PROMPT.format(
+        project_name=project.name,
+        project_slug=project.slug,
+        service=metrics.get("service") or (project.settings or {}).get("serviceType") or "FM",
+        service_class=metrics.get("service_class") or (project.settings or {}).get("serviceClass") or "—",
+        location=metrics.get("location") or snapshot.get("tx_location_name") or "—",
+        radius_km=metrics.get("radius_km") or snapshot.get("requested_radius_km") or snapshot.get("radius") or "—",
+        erp_dbm=metrics.get("erp_dbm") or "—",
+        haat_average_m=metrics.get("haat_average_m") or "—",
+        project_notes=metrics.get("project_notes") or "Sem notas registradas.",
+        metrics_json=metrics_json,
+        link_summary=link_summary or "Nenhum receptor cadastrado.",
+        links_json=links_json,
+        sections_json=sections_json,
+    )
+
+    response = model.generate_content([{"text": prompt}])
+    text = _extract_json_text(getattr(response, "text", ""))
+    try:
+        issues = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise AISummaryError("Formato de resposta inválido do modelo.") from exc
+
+    if isinstance(issues, dict):
+        issues = [issues]
+    normalized: List[Dict[str, Any]] = []
+    if isinstance(issues, list):
+        for item in issues:
+            if not isinstance(item, dict):
+                continue
+            field = str(item.get("field") or "").strip()
+            if not field:
+                continue
+            normalized.append({
+                "field": field,
+                "issue": item.get("issue") or item.get("mensagem") or item.get("detalhe") or "Inconsistência não detalhada.",
+                "severity": item.get("severity") or "warning",
+                "corrected_text": item.get("corrected_text") or item.get("correcao"),
+                "evidence": item.get("evidence") or item.get("justificativa") or item.get("explicacao"),
+            })
+    return normalized

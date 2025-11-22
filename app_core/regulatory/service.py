@@ -6,9 +6,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 from extensions import db
-from app_core.storage import ensure_project_path_exists, storage_root
+from app_core.storage import inline_asset_path
+from app_core.storage_utils import rehydrate_asset_data
 from app_core.utils import slugify
-from app_core.models import Project
+from app_core.models import Asset, AssetType, Project
 
 from .models import (
     RegulatoryAttachment,
@@ -129,34 +130,63 @@ def _attachment_type(value: str) -> RegulatoryAttachmentType:
         return RegulatoryAttachmentType.custom
 
 
-def _persist_attachment(report: RegulatoryReport, attachment_data: Dict[str, Any], report_dir: Path) -> Path:
-    attachments_dir = report_dir / 'attachments'
-    attachments_dir.mkdir(parents=True, exist_ok=True)
+def _load_attachment_bytes(project: Project, path_value: str | None) -> bytes | None:
+    if not path_value:
+        return None
+    if str(path_value).startswith('inline://'):
+        asset = Asset.query.filter_by(project_id=project.id, path=path_value).first()
+        if asset:
+            if asset.data:
+                return bytes(asset.data)
+            return rehydrate_asset_data(asset)
+        return None
+    # Legacy reference pointing to disk; try to locate Asset row and rehydrate.
+    asset = Asset.query.filter_by(project_id=project.id, path=path_value).first()
+    if asset:
+        payload = asset.data or rehydrate_asset_data(asset)
+        return payload
+    return None
+
+
+def _persist_attachment(report: RegulatoryReport, attachment_data: Dict[str, Any]) -> Tuple[RegulatoryAttachment, Tuple[str, bytes]]:
+    project = report.project
     raw_name = attachment_data.get('name') or f"attachment-{datetime.utcnow().timestamp():.0f}.pdf"
     filename = slugify(Path(raw_name).stem) + Path(raw_name).suffix
-    file_path = attachments_dir / filename
 
+    data = None
     if attachment_data.get('content'):
         data = base64.b64decode(attachment_data['content'])
-        file_path.write_bytes(data)
     elif attachment_data.get('path'):
-        source = Path(attachment_data['path'])
-        if source.exists():
-            file_path.write_bytes(source.read_bytes())
-        else:
-            file_path.write_text('Arquivo não encontrado na origem informada.')
-    else:
-        file_path.write_text('Placeholder gerado automaticamente.')
+        data = _load_attachment_bytes(project, attachment_data['path'])
+    if data is None:
+        data = f"Arquivo gerado automaticamente em {datetime.utcnow():%Y-%m-%d %H:%M UTC}".encode('utf-8')
+
+    extension = Path(filename).suffix or '.bin'
+    asset = Asset(
+        project_id=project.id,
+        type=AssetType.pdf if extension.lower() == '.pdf' else AssetType.other,
+        path=inline_asset_path('regulatory', extension),
+        mime_type=attachment_data.get('mime_type') or ('application/pdf' if extension.lower() == '.pdf' else 'application/octet-stream'),
+        byte_size=len(data),
+        data=data,
+        meta={
+            'report_id': str(report.id),
+            'attachment_type': attachment_data.get('type'),
+            'name': filename,
+        },
+    )
+    db.session.add(asset)
+    db.session.flush()
 
     attachment = RegulatoryAttachment(
         report_id=report.id,
         type=_attachment_type(attachment_data.get('type', 'custom')),
-        path=str(file_path.relative_to(storage_root())),
+        path=asset.path,
         description=attachment_data.get('description'),
-        mime_type=attachment_data.get('mime_type'),
+        mime_type=attachment_data.get('mime_type') or asset.mime_type,
     )
     db.session.add(attachment)
-    return file_path
+    return attachment, (filename, data)
 
 
 def generate_regulatory_report(project: Project, payload: Dict[str, Any], *, name: str | None = None) -> RegulatoryReport:
@@ -191,24 +221,44 @@ def generate_regulatory_report(project: Project, payload: Dict[str, Any], *, nam
         db.session.add(validation)
 
     attachments_payload = payload.get('attachments') or []
-    report_dir = ensure_project_path_exists(project, 'regulatory', report_slug)
-    saved_attachments: List[Path] = []
+    saved_attachments: List[Tuple[str, bytes]] = []
     for attachment in attachments_payload:
-        saved_attachments.append(_persist_attachment(report, attachment, report_dir))
+        _, bundle_entry = _persist_attachment(report, attachment)
+        if bundle_entry:
+            saved_attachments.append(bundle_entry)
 
     generator = RegulatoryReportGenerator()
     context = generator.build_context(project, report, payload, outcome.results, outcome.metrics)
     html = generator.render_html(context)
 
-    pdf_path = report_dir / 'relatorio.pdf'
-    generator.generate_pdf(html, pdf_path)
+    pdf_bytes = generator.generate_pdf_bytes(html)
+    zip_bytes = generator.build_zip_bytes(pdf_bytes, saved_attachments)
 
-    zip_path = generator.build_zip(pdf_path, saved_attachments, report_dir)
-
-    report.mark_generated(
-        str(pdf_path.relative_to(storage_root())),
-        str(zip_path.relative_to(storage_root())),
+    pdf_asset = Asset(
+        project_id=project.id,
+        type=AssetType.pdf,
+        path=inline_asset_path('regulatory', 'pdf'),
+        mime_type='application/pdf',
+        byte_size=len(pdf_bytes),
+        data=pdf_bytes,
+        meta={'report_id': str(report.id), 'name': f"{report.slug}.pdf"},
     )
+    db.session.add(pdf_asset)
+    db.session.flush()
+
+    zip_asset = Asset(
+        project_id=project.id,
+        type=AssetType.other,
+        path=inline_asset_path('regulatory', 'zip'),
+        mime_type='application/zip',
+        byte_size=len(zip_bytes),
+        data=zip_bytes,
+        meta={'report_id': str(report.id), 'name': 'mosaico_submit.zip'},
+    )
+    db.session.add(zip_asset)
+    db.session.flush()
+
+    report.mark_generated(pdf_asset.path, zip_asset.path)
 
     if outcome.overall_status == 'blocked':
         report.status = RegulatoryReportStatus.failed

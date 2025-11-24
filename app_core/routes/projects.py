@@ -20,6 +20,7 @@ from flask import (
     send_file,
     url_for,
     flash,
+    session,
 )
 from flask_login import current_user, login_required
 from sqlalchemy.exc import SQLAlchemyError
@@ -103,6 +104,7 @@ def new_project():
                 error = f"Erro ao criar projeto: {exc}"
             else:
                 flash("Projeto criado com sucesso!", "success")
+                session['active_project_slug'] = project.slug
                 return redirect(url_for("projects.view_project", slug=slug))
 
     return render_template("projects/new.html", error=error)
@@ -112,6 +114,7 @@ def new_project():
 @login_required
 def view_project(slug):
     project = project_by_slug_or_404(slug, current_user.uuid)
+    session['active_project_slug'] = project.slug
     assets = project.assets
     jobs = project.coverage_jobs
     reports = project.reports
@@ -130,6 +133,10 @@ def view_project(slug):
 @bp.route("/<slug>/assets/<asset_id>/preview", methods=["GET"])
 @login_required
 def asset_preview(slug, asset_id):
+    try:
+        UUID(str(asset_id))
+    except (ValueError, TypeError, AttributeError):
+        abort(404)
     project = project_by_slug_or_404(slug, current_user.uuid)
     asset = Asset.query.filter_by(id=asset_id, project_id=project.id).first()
     blob = _asset_bytes(asset)

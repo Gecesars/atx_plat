@@ -24,6 +24,7 @@ geopy==2.4.1
 geojson==3.2.0
 scikit-learn==1.7.2
 reportlab==4.4.4
+reverse_geocoder==1.5.1
 
 # --- Utilities & helpers ---
 requests==2.32.5

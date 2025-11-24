@@ -2,30 +2,15 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass, field
-from functools import lru_cache
+import math
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
-import requests
-from flask import current_app
-
-from app_core.analytics.ibge_catalog import (
-    _create_sidra_session,
-    fetch_income_per_capita_by_state,
-    get_municipality_metadata,
-    get_or_resolve_municipality,
-)
 from app_core.integrations import ibge as ibge_api
 
 LOGGER = logging.getLogger(__name__)
 
-_GEOCODE_PRECISION = 3  # grau ~ 110m
-OSM_REVERSE_URL = "https://nominatim.openstreetmap.org/reverse"
-
-
-def _round_coord(value: float, precision: int = _GEOCODE_PRECISION) -> float:
-    return round(float(value), precision)
 
 
 @dataclass
@@ -38,6 +23,7 @@ class MunicipalityCoverage:
     sample_lat: float
     sample_lon: float
     points: int = 0
+    tile_hits: int = 0
     population: Optional[float] = None
     population_year: Optional[int] = None
     income_per_capita: Optional[float] = None
@@ -63,6 +49,50 @@ def _parse_signal_dict(signal_dict: Dict[str, float], min_dbuv: float) -> List[T
     return points
 
 
+def _tile_center_latlon(x_idx: int, y_idx: int, zoom: int) -> Tuple[float, float]:
+    scale = 1 << zoom
+    lon_deg = (x_idx + 0.5) / scale * 360.0 - 180.0
+    n = math.pi - (2.0 * math.pi * (y_idx + 0.5) / scale)
+    lat_rad = math.atan(math.sinh(n))
+    lat_deg = math.degrees(lat_rad)
+    return lat_deg, lon_deg
+
+
+def _extract_tile_stats(summary_data: Dict[str, object]) -> Dict[str, Dict[str, object]]:
+    stats = summary_data.get("tile_stats") or {}
+    if not stats:
+        tiles_payload = summary_data.get("tiles") or {}
+        if isinstance(tiles_payload, dict):
+            stats = tiles_payload.get("stats") or tiles_payload.get("tile_stats") or {}
+    return stats if isinstance(stats, dict) else {}
+
+
+def _collect_tile_points(tile_stats: Dict[str, Dict[str, object]]) -> Tuple[List[Tuple[float, float, float]], Optional[int]]:
+    normalized: Dict[int, Dict[str, object]] = {}
+    for zoom_key, bucket in tile_stats.items():
+        try:
+            zoom = int(zoom_key)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(bucket, dict) and bucket:
+            normalized[zoom] = bucket
+    if not normalized:
+        return [], None
+    selected_zoom = max(normalized.keys())
+    points: List[Tuple[float, float, float]] = []
+    for tile_key, value in normalized[selected_zoom].items():
+        try:
+            x_str, y_str = tile_key.split("/")
+            x_idx = int(x_str)
+            y_idx = int(y_str)
+            tile_value = float(value)
+        except (ValueError, TypeError, AttributeError):
+            continue
+        lat, lon = _tile_center_latlon(x_idx, y_idx, selected_zoom)
+        points.append((lat, lon, tile_value))
+    return points, selected_zoom
+
+
 def _cluster_points(points: List[Tuple[float, float, float]], precision: int = 2, limit: int = 400) -> List[Tuple[float, float, float, int]]:
     clusters: Dict[Tuple[float, float], Dict[str, float]] = {}
     for lat, lon, value in points:
@@ -82,53 +112,32 @@ def _cluster_points(points: List[Tuple[float, float, float]], precision: int = 2
     return cluster_list
 
 
-@lru_cache(maxsize=4096)
-def _reverse_geocode_osm_cached(lat_key: float, lon_key: float) -> Optional[Dict[str, str]]:
-    lat = float(lat_key)
-    lon = float(lon_key)
-    params = {
-        "lat": lat,
-        "lon": lon,
-        "format": "jsonv2",
-        "accept-language": "pt-BR",
-    }
-    headers = {"User-Agent": "ATXCoverage/1.0 (+https://atxcoverage)"}
-    try:
-        resp = requests.get(OSM_REVERSE_URL, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
-        address = resp.json().get("address") or {}
-        name = address.get("city") or address.get("town") or address.get("village") or address.get("municipality")
-        state = address.get("state_code") or address.get("state")
-        if not name:
-            return None
-
-        return {"name": name, "state": state, "country": address.get("country")}
-    except requests.RequestException as exc:
-        LOGGER.debug("reverse_geocode_osm_failed", extra={"error": str(exc)})
-        return None
-
-
-def _reverse_geocode_osm(lat: float, lon: float) -> Optional[Dict[str, str]]:
-    lat_key = _round_coord(lat)
-    lon_key = _round_coord(lon)
-    return _reverse_geocode_osm_cached(lat_key, lon_key)
-
-
 def _resolve_municipality(lat: float, lon: float) -> Optional[Dict[str, str]]:
-    detail = _reverse_geocode_osm(lat, lon)
-    if not detail:
+    try:
+        detail = ibge_api.reverse_geocode_offline(lat, lon)
+    except ibge_api.ReverseGeocoderUnavailable as exc:
+        LOGGER.warning("coverage_ibge.geocode_unavailable", extra={"error": str(exc)})
+        return None
+    if not detail or not detail.get("name"):
         return None
 
-    state_hint = ibge_api.normalize_state_code(detail.get("state"))
-    code = get_or_resolve_municipality(detail.get("name"), state_hint)
+    state_hint = detail.get("state_code") or detail.get("state")
+    code = ibge_api.resolve_municipality_code(detail.get("name"), state_hint)
+    if not code:
+        entry = ibge_api.find_local_municipality(detail.get("name"), state_hint)
+        if entry:
+            code = entry.get("code")
     if not code:
         return None
-
-    meta = get_municipality_metadata(code)
-    if not meta:
+    entry = ibge_api.get_local_municipality_entry(code)
+    if not entry:
         return None
-
-    return meta
+    return {
+        "ibge_code": str(code),
+        "municipality": entry.get("name") or detail.get("name"),
+        "state": entry.get("state") or detail.get("state"),
+        "state_id": entry.get("state_code"),
+    }
 
 
 def _enrich_municipalities_with_ibge(
@@ -138,30 +147,21 @@ def _enrich_municipalities_with_ibge(
     if not municipalities:
         return
 
-    session = _create_sidra_session()
-    state_codes = {info.state_id for info in municipalities.values() if info.state_id}
-    income_data = fetch_income_per_capita_by_state(state_codes, session=session)
-
     for code, info in municipalities.items():
-        pop_value = None
-        demographics = ibge_api.fetch_demographics_by_code(code)
-        if demographics and demographics.get("total") is not None:
-            pop_value = demographics["total"]
-            info.population_year = 2022
-        else:
-            legacy_value = ibge_api.fetch_population_legacy(code)
-            if legacy_value is not None:
-                pop_value = legacy_value
-                info.population_year = 2022
-            else:
-                info.population_year = None
-        info.population = pop_value
-
-        if info.state_id:
-            income_entry = income_data.get(info.state_id)
-            if income_entry:
-                info.income_per_capita = income_entry.get("value")
-                info.income_year = income_entry.get("year")
+        entry = ibge_api.get_local_municipality_entry(code)
+        if not entry:
+            continue
+        population = entry.get("population")
+        if population is not None:
+            info.population = population
+            info.population_year = entry.get("population_year")
+        income = entry.get("income_per_capita")
+        if income is not None:
+            info.income_per_capita = income
+            info.income_year = entry.get("income_year")
+        state_code = entry.get("state_code")
+        if state_code:
+            info.state_id = state_code
 
 
 def summarize_coverage_demographics(
@@ -179,18 +179,40 @@ def summarize_coverage_demographics(
         with summary_json_path.open("r", encoding="utf-8") as handle:
             summary_data = json.load(handle)
 
+    tile_stats = _extract_tile_stats(summary_data)
+    tile_points, tile_zoom = _collect_tile_points(tile_stats)
+    tiles_total = len(tile_points) or None
+    tile_hits = [point for point in tile_points if point[2] >= min_field_dbuvm]
+    tiles_covered = len(tile_hits) if tile_points else None
+
+    points_source = "tiles" if tile_points else "signal_dict"
     signal_dict = summary_data.get("signal_level_dict") or {}
-    points = _parse_signal_dict(signal_dict, min_field_dbuvm)
+    signal_points_total = len(signal_dict) or None
+    points = tile_hits if tile_hits else []
+
     if not points:
-        return {
-            "threshold_dbuv": min_field_dbuvm,
-            "total_pixels": 0,
-            "cluster_count": 0,
-            "municipalities": [],
-        }
+        points = _parse_signal_dict(signal_dict, min_field_dbuvm)
+        if points:
+            points_source = "signal_dict"
+        else:
+            return {
+                "threshold_dbuv": min_field_dbuvm,
+                "total_pixels": 0,
+                "cluster_count": 0,
+                "municipalities": [],
+                "sample_source": points_source,
+                "tile_zoom": tile_zoom,
+                "tiles_total": tiles_total,
+                "tiles_covered": tiles_covered,
+                "signal_points_total": signal_points_total,
+                "population_covered": 0,
+                "municipality_count": 0,
+            }
 
     clusters = _cluster_points(points, precision=cluster_precision, limit=cluster_limit)
     municipalities: Dict[str, MunicipalityCoverage] = {}
+
+    uses_tiles = points_source == "tiles"
 
     for lat, lon, value, count in clusters:
         meta = _resolve_municipality(lat, lon)
@@ -216,6 +238,8 @@ def summarize_coverage_demographics(
                 municipality.max_field_dbuvm = value
                 municipality.sample_lat = lat
                 municipality.sample_lon = lon
+        if uses_tiles:
+            municipality.tile_hits += count
 
     _enrich_municipalities_with_ibge(municipalities)
 
@@ -226,7 +250,10 @@ def summarize_coverage_demographics(
     )
 
     payload = []
+    population_total = 0.0
     for info in ordered:
+        if info.population:
+            population_total += float(info.population)
         payload.append(
             {
                 "ibge_code": info.ibge_code,
@@ -236,6 +263,7 @@ def summarize_coverage_demographics(
                 "sample_lat": info.sample_lat,
                 "sample_lon": info.sample_lon,
                 "points": info.points,
+                "tile_hits": info.tile_hits,
                 "population": info.population,
                 "population_year": info.population_year,
                 "income_per_capita": info.income_per_capita,
@@ -243,9 +271,19 @@ def summarize_coverage_demographics(
             }
         )
 
+    municipality_count = len(payload)
+    population_value = population_total if population_total > 0 else None
+
     return {
         "threshold_dbuv": min_field_dbuvm,
         "total_pixels": len(points),
         "cluster_count": len(clusters),
         "municipalities": payload,
+        "sample_source": points_source,
+        "tile_zoom": tile_zoom,
+        "tiles_total": tiles_total,
+        "tiles_covered": tiles_covered,
+        "signal_points_total": signal_points_total,
+        "population_covered": population_value,
+        "municipality_count": municipality_count,
     }

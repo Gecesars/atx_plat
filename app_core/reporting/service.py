@@ -4,6 +4,7 @@ import base64
 import io
 import textwrap
 from datetime import datetime
+import uuid
 from typing import Any, Dict, List, Optional
 import math
 import json
@@ -148,7 +149,26 @@ def _latest_snapshot(project: Project) -> Dict[str, Any]:
     snapshot = settings.get('lastCoverage')
     if not snapshot:
         raise AnalysisReportError('Projeto não possui mancha de cobertura salva.')
-    return snapshot
+    normalized_snapshot = dict(snapshot)
+
+    def _coerce_uuid(value):
+        if isinstance(value, dict):
+            value = value.get('id') or value.get('value')
+        if value in (None, ''):
+            return None
+        try:
+            return str(uuid.UUID(str(value)))
+        except (ValueError, TypeError, AttributeError):
+            return None
+
+    for key in ('asset_id', 'colorbar_asset_id', 'map_snapshot_asset_id', 'json_asset_id'):
+        coerced = _coerce_uuid(normalized_snapshot.get(key))
+        if coerced:
+            normalized_snapshot[key] = coerced
+        else:
+            normalized_snapshot.pop(key, None)
+
+    return normalized_snapshot
 
 
 def _format_number(value, unit=""):
@@ -1288,6 +1308,22 @@ def build_analysis_preview(project: Project, *, allow_ibge: bool = True) -> Dict
     snapshot = _latest_snapshot(project)
     user = project.user
     settings = project.settings or {}
+    # sincroniza centro/nome/elevação da TX com o valor mais recente salvo no projeto
+    tx_lat = settings.get('latitude')
+    tx_lng = settings.get('longitude')
+    tx_name = settings.get('txLocationName') or settings.get('tx_location_name')
+    tx_elev = settings.get('txElevation') or settings.get('tx_site_elevation')
+    if tx_lat is not None and tx_lng is not None:
+        center = snapshot.get('center') or snapshot.get('tx_location') or {}
+        center = dict(center)
+        center['lat'] = tx_lat
+        center['lng'] = tx_lng
+        snapshot['center'] = center
+        snapshot['tx_location'] = center
+    if tx_name:
+        snapshot['tx_location_name'] = tx_name
+    if tx_elev is not None:
+        snapshot['tx_site_elevation'] = tx_elev
     company_logo_blob = _project_company_logo(project)
     center_metrics = snapshot.get('center_metrics') or {}
     loss_components = snapshot.get('loss_components') or {}
@@ -1960,9 +1996,33 @@ def generate_analysis_report(
             header_color,
             company_logo=company_logo_blob,
         )
+        threshold_value = int((coverage_ibge or {}).get('threshold_dbuv', 25))
         c.setFont('Helvetica-Bold', 11)
-        c.drawString(40, y, f"Municípios com campo ≥ {int((coverage_ibge or {}).get('threshold_dbuv', 25))} dBµV/m")
+        c.drawString(40, y, f"Municípios com campo ≥ {threshold_value} dBµV/m")
         y -= 18
+
+        summary_lines: list[str] = []
+        tiles_total = (coverage_ibge or {}).get('tiles_total')
+        tiles_covered = (coverage_ibge or {}).get('tiles_covered')
+        tile_zoom = (coverage_ibge or {}).get('tile_zoom')
+        municipality_count = (coverage_ibge or {}).get('municipality_count')
+        population_estimate = (coverage_ibge or {}).get('population_covered')
+        if tiles_total not in (None, 0):
+            zoom_text = f" (z{tile_zoom})" if tile_zoom is not None else ""
+            summary_lines.append(f"Tiles avaliados{zoom_text}: {_format_int(tiles_total)}")
+        if tiles_covered is not None:
+            summary_lines.append(f"Tiles acima do limiar: {_format_int(tiles_covered)}")
+        if municipality_count not in (None, 0):
+            summary_lines.append(f"Municípios elegíveis: {_format_int(municipality_count)}")
+        if population_estimate not in (None, 0):
+            summary_lines.append(f"População estimada atendida: {_format_int(population_estimate)}")
+        if summary_lines:
+            c.setFont('Helvetica', 9)
+            for line in summary_lines:
+                c.drawString(40, y, line)
+                y -= 12
+            y -= 6
+
         coverage_columns = [
             ("Município/UF", 150),
             ("Campo máx (dBµV/m)", 100),

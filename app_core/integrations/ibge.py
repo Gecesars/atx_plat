@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import unicodedata
 from functools import lru_cache
 from pathlib import Path
@@ -10,6 +11,11 @@ from urllib.parse import urlencode
 
 import requests
 from flask import current_app
+
+try:
+    import reverse_geocoder as rg
+except ImportError:  # pragma: no cover - fallback caso dep opcional não esteja instalada
+    rg = None
 
 try:
     from openpyxl import load_workbook
@@ -104,6 +110,9 @@ _LOCAL_DATASET_PATH = ROOT_DIR / "data" / "ibge_population_income.json"
 _POPULATION_XLSX = ROOT_DIR / "docs" / "CD2022_Populacao_Coletada_Imputada_e_Total_Municipio_e_UF_20231222.xlsx"
 _INCOME_XLSX = ROOT_DIR / "docs" / "Agregados_por_municipios_renda_responsavel_BR.xlsx"
 _LOCAL_DATASET: Dict[str, Any] | None = None
+_RG_CLIENT = None
+
+ALLOW_REMOTE_LOOKUPS = os.environ.get("IBGE_ALLOW_REMOTE", "0").lower() in ("1", "true", "yes")
 
 
 def _log(event: str, level: int = logging.WARNING, **extra):
@@ -182,10 +191,12 @@ def _build_dataset_from_xlsx() -> Dict[str, Any]:
             population = _coerce_int(total)
             if population is None:
                 continue
-            dataset[str(code)] = {
-                "code": str(code),
+            entry_code = str(code)
+            dataset[entry_code] = {
+                "code": entry_code,
                 "name": name,
                 "state": uf,
+                "state_code": f"{uf_code:02d}",
                 "population": population,
                 "population_year": 2022,
             }
@@ -233,7 +244,14 @@ def _load_local_dataset() -> Dict[str, Any]:
     try:
         payload = json.loads(_LOCAL_DATASET_PATH.read_text())
         municipalities = payload.get("municipalities") or {}
-        _LOCAL_DATASET = {str(code): data for code, data in municipalities.items()}
+        normalized: Dict[str, Any] = {}
+        for code, data in municipalities.items():
+            if isinstance(data, dict):
+                data.setdefault("code", str(code))
+                if data.get("code"):
+                    data.setdefault("state_code", str(data["code"])[0:2])
+            normalized[str(code)] = data
+        _LOCAL_DATASET = normalized
     except Exception as exc:
         _log("ibge.local_dataset.load_failed", level=logging.ERROR, error=str(exc))
         if _POPULATION_XLSX.exists() and _INCOME_XLSX.exists():
@@ -247,7 +265,12 @@ def _local_lookup_by_code(code: str | None) -> Dict[str, Any] | None:
     if not code:
         return None
     dataset = _load_local_dataset()
-    return dataset.get(str(code))
+    entry = dataset.get(str(code))
+    if entry and isinstance(entry, dict):
+        entry.setdefault("code", str(code))
+        if entry.get("code"):
+            entry.setdefault("state_code", str(entry["code"])[0:2])
+    return entry
 
 
 def _local_lookup_by_city(city: str | None, state: str | None) -> Dict[str, Any] | None:
@@ -263,8 +286,60 @@ def _local_lookup_by_city(city: str | None, state: str | None) -> Dict[str, Any]
             continue
         if normalized_state and normalize_state_code(entry.get("state")) != normalized_state:
             continue
+        entry.setdefault("code", entry.get("code"))
+        if entry.get("code"):
+            entry.setdefault("state_code", str(entry["code"])[0:2])
         return entry
     return None
+
+
+class ReverseGeocoderUnavailable(RuntimeError):
+    """Erro lançado quando a dependência de geocodificação offline não está disponível."""
+
+
+def _get_reverse_geocoder():
+    global _RG_CLIENT
+    if _RG_CLIENT is not None:
+        return _RG_CLIENT
+    if rg is None:
+        raise ReverseGeocoderUnavailable(
+            "Pacote reverse_geocoder não instalado. Execute pip install reverse_geocoder."
+        )
+    try:
+        # modo single-process evita /dev/shm; modo 1 usa shared memory quando disponível
+        try:
+            _RG_CLIENT = rg.RGeocoder(mode=1, verbose=False)
+        except Exception:
+            _RG_CLIENT = rg.RGeocoder(mode=0, verbose=False)
+    except Exception as exc:
+        raise ReverseGeocoderUnavailable(f"Reverse geocoder init failed: {exc}") from exc
+    return _RG_CLIENT
+
+
+def reverse_geocode_offline(lat: float, lon: float) -> Dict[str, Any]:
+    geocoder = _get_reverse_geocoder()
+    try:
+        result = geocoder.query([(float(lat), float(lon))])[0]
+    except Exception as exc:  # pragma: no cover - erros raros do dataset
+        raise ReverseGeocoderUnavailable(f"Reverse geocode falhou: {exc}") from exc
+    state_label = result.get("adm1") or result.get("admin1") or result.get("adm2")
+    state_code = normalize_state_code(state_label)
+    return {
+        "name": result.get("name"),
+        "state": state_label,
+        "state_code": state_code,
+        "country": result.get("cc"),
+        "provider": "reverse_geocoder",
+    }
+
+
+def get_local_municipality_entry(code: str | None) -> Dict[str, Any] | None:
+    entry = _local_lookup_by_code(code)
+    return entry
+
+
+def find_local_municipality(city: str | None, state: str | None = None) -> Dict[str, Any] | None:
+    return _local_lookup_by_city(city, state)
 
 
 def normalize_state_code(value: str | None) -> str | None:
@@ -317,6 +392,8 @@ def resolve_municipality_code(city: str | None, state: str | None = None) -> str
     entry = _local_lookup_by_city(city, state)
     if entry and entry.get("code"):
         return str(entry["code"])
+    if not ALLOW_REMOTE_LOOKUPS:
+        return None
     # normaliza a consulta para melhor acerto/cache
     params = {"nome": _slugify(city)}
     try:

@@ -90,6 +90,101 @@ from app_core.integrations import ibge as ibge_api
 GAIN_OFFSET_DBI_DBD = 2.15
 
 
+PROJECT_SETTING_FIELDS = [
+    "towerHeight",
+    "rxHeight",
+    "Total_loss",
+    "antennaGain",
+    "rxGain",
+    "transmissionPower",
+    "frequency",
+    "antennaTilt",
+    "antennaDirection",
+    "latitude",
+    "longitude",
+    "waterDensity",
+    "timePercentage",
+    "temperature",
+    "pressure",
+    "serviceType",
+    "propagationModel",
+    "polarization",
+    "p452Version",
+    "coverageEngine",
+    "radius",
+    "minSignalLevel",
+    "maxSignalLevel",
+]
+
+
+def _blank_project_payload(user: User, project: Project) -> dict:
+    defaults = {
+        'username': user.username,
+        'email': user.email,
+        'nomeUsuario': user.username,
+        'coverageEngine': CoverageEngine.p1546.value,
+        'projectSlug': project.slug,
+        'projectName': project.name,
+        'projectDescription': project.description,
+        'projectSettings': {},
+        'receiverBookmarks': [],
+        'lastCoverage': None,
+        'projectLastSavedAt': None,
+        'txLocationName': None,
+        'txElevation': None,
+        'latitude': None,
+        'longitude': None,
+        'transmissionPower': None,
+        'frequency': None,
+        'towerHeight': None,
+        'rxHeight': None,
+        'Total_loss': None,
+        'antennaGain': None,
+        'rxGain': None,
+        'antennaTilt': None,
+        'antennaDirection': None,
+        'serviceType': None,
+        'propagationModel': None,
+        'polarization': None,
+        'timePercentage': 40.0,
+        'p452Version': 16,
+        'temperature': 20.0,
+        'pressure': 1013.0,
+        'waterDensity': 7.5,
+        'txData': {},
+        'txLocationName': None,
+        'txElevation': None,
+        'txLocation': None,
+    }
+    return defaults
+
+
+def _is_project_settings_empty(payload: dict | None) -> bool:
+    if not payload:
+        return True
+    allowed_empty_keys = {'receiverBookmarks', 'lastCoverage', 'lastSavedAt'}
+    for key, value in payload.items():
+        if key in allowed_empty_keys:
+            if value:
+                return False
+            continue
+        return False
+    return True
+
+
+def _apply_project_settings(payload: dict, settings: dict | None) -> dict:
+    if not payload or not settings:
+        return payload
+    for key in PROJECT_SETTING_FIELDS:
+        if settings.get(key) is not None:
+            payload[key] = settings.get(key)
+    tx_name = settings.get('txLocationName')
+    if tx_name is not None:
+        payload['txLocationName'] = tx_name
+    tx_elev = settings.get('txElevation')
+    if tx_elev is not None:
+        payload['txElevation'] = tx_elev
+    return payload
 def _remember_active_project(project: Project | None) -> None:
     if project and getattr(project, "slug", None):
         session['active_project_slug'] = project.slug
@@ -390,6 +485,56 @@ def _project_settings_with_dynamic(project: Project | None) -> dict:
         elif 'lastCoverage' in base:
             base.pop('lastCoverage', None)
     return base
+
+
+def _sync_project_receivers(project: Project, receivers: list[dict] | None) -> None:
+    if project is None:
+        return
+    if receivers is None:
+        receivers = []
+
+    def _coerce_int_local(value):
+        try:
+            if value in (None, "", "-", "..."):
+                return None
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+    # remove todos os registros antigos e recria a partir do payload atual
+    ProjectReceiver.query.filter_by(project_id=project.id).delete(synchronize_session=False)
+    sanitized: list[dict] = []
+    for idx, raw in enumerate(receivers):
+        if not isinstance(raw, dict):
+            continue
+        lat = _coerce_float(raw.get('lat') or (raw.get('location') or {}).get('lat'))
+        lon = _coerce_float(raw.get('lng') or raw.get('lon') or (raw.get('location') or {}).get('lng') or (raw.get('location') or {}).get('lon'))
+        legacy_id = raw.get('id') or raw.get('label') or f"rx-{idx+1}"
+        label = raw.get('label') or raw.get('name') or legacy_id
+        municipality = raw.get('municipality') or (raw.get('location') or {}).get('municipality')
+        state = raw.get('state') or (raw.get('location') or {}).get('state')
+        ibge_info = raw.get('ibge') or {}
+        ibge_code = ibge_info.get('code') or ibge_info.get('ibge_code') or raw.get('ibge_code')
+        population = raw.get('population') or ibge_info.get('population')
+        population_year = raw.get('population_year') or ibge_info.get('population_year')
+        record = ProjectReceiver(
+            project_id=project.id,
+            legacy_id=str(legacy_id),
+            label=str(label),
+            latitude=lat,
+            longitude=lon,
+            municipality=municipality,
+            state=state,
+            summary=raw,
+            ibge_code=ibge_code,
+            population=_coerce_int_local(population),
+            population_year=_coerce_int_local(population_year),
+            profile_asset_id=raw.get('profile_asset_id'),
+        )
+        db.session.add(record)
+        sanitized.append(raw)
+    settings = dict(project.settings or {})
+    settings['receiverBookmarks'] = sanitized
+    project.settings = settings
 
 
 def _persist_project_coverage_record(
@@ -829,6 +974,10 @@ def _prepare_tx_object(base_tx, overrides=None, pattern_bytes=None):
 @bp.route("/salvar-dados", methods=["POST"])
 @login_required
 def salvar_dados():
+    try:
+        db.session.rollback()
+    except Exception:
+        pass
     data = request.get_json(silent=True) or {}
     project_slug = request.args.get('project') or data.get('projectSlug')
     project = None
@@ -859,57 +1008,68 @@ def salvar_dados():
         "waterDensity": "water_density",
     }
 
+    project_settings_payload = dict(project.settings or {}) if project else {}
+    user_temperature_c = (current_user.temperature_k - 273.15) if current_user.temperature_k is not None else None
+
+    def _assign_value(key, attr_name, value):
+        if project:
+            project_settings_payload[key] = value
+        else:
+            setattr(current_user, attr_name, value)
+
     for incoming_key, model_attr in simple_float_fields.items():
         if incoming_key in data:
             value = _coerce_float(data.get(incoming_key))
             if value is not None:
                 if incoming_key == "antennaGain":
                     value = value + GAIN_OFFSET_DBI_DBD
-                setattr(current_user, model_attr, value)
+                _assign_value(incoming_key, model_attr, value)
 
     # Ganho de receptor fixo em 0 dBi para estudos ponto-área
-    current_user.rx_gain = 0.0
+    _assign_value("rxGain", "rx_gain", 0.0)
 
     # tempo percentual (0.001 a 50%)
     if "timePercentage" in data:
         time_pct_val = _coerce_float(data.get("timePercentage"))
         if time_pct_val is not None:
-            current_user.time_percentage = max(0.001, min(time_pct_val, 50.0))
+            _assign_value("timePercentage", "time_percentage", max(0.001, min(time_pct_val, 50.0)))
 
     # temperatura (°C -> K)
     if "temperature" in data:
         temp_c = _coerce_float(data.get("temperature"))
         if temp_c is not None:
-            current_user.temperature_k = temp_c + 273.15
+            if project:
+                project_settings_payload["temperature"] = temp_c
+            else:
+                current_user.temperature_k = temp_c + 273.15
 
     # pressão (hPa)
     if "pressure" in data:
         pressure_val = _coerce_float(data.get("pressure"))
         if pressure_val is not None:
-            current_user.pressure_hpa = pressure_val
+            _assign_value("pressure", "pressure_hpa", pressure_val)
 
     # azimute (0..359°)
     if "antennaDirection" in data:
         direction_raw = data.get("antennaDirection")
         if direction_raw is None or str(direction_raw).strip() == "":
-            current_user.antenna_direction = None
+            _assign_value("antennaDirection", "antenna_direction", None)
         else:
-            # usar a versão unificada do helper que pode retornar None
-            current_user.antenna_direction = _normalize_direction_value(direction_raw)
+            _assign_value("antennaDirection", "antenna_direction", _normalize_direction_value(direction_raw))
 
     # campos textuais / categóricos
     if "propagationModel" in data:
-        current_user.propagation_model = _coerce_str(data.get("propagationModel"))
+        _assign_value("propagationModel", "propagation_model", _coerce_str(data.get("propagationModel")))
 
     if "serviceType" in data:
-        current_user.servico = _coerce_str(data.get("serviceType"))
+        _assign_value("serviceType", "servico", _coerce_str(data.get("serviceType")))
     elif "service" in data:
-        current_user.servico = _coerce_str(data.get("service"))
+        _assign_value("serviceType", "servico", _coerce_str(data.get("service")))
 
     if "polarization" in data:
         pol_val = _coerce_str(data.get("polarization"))
         if pol_val:
-            current_user.polarization = pol_val.lower()
+            _assign_value("polarization", "polarization", pol_val.lower())
 
     if "p452Version" in data:
         version_val = data.get("p452Version")
@@ -919,37 +1079,28 @@ def salvar_dados():
             version_val = current_user.p452_version or 16
         if version_val not in (14, 16):
             version_val = 16
-        current_user.p452_version = version_val
+        _assign_value("p452Version", "p452_version", version_val)
 
-    # 4. Persistir configurações no projeto (snapshot)
-    project_settings_payload = {}
-    temperature_c = (current_user.temperature_k - 273.15) if current_user.temperature_k is not None else None
+    if project and "txLocationName" in data:
+        project_settings_payload["txLocationName"] = _coerce_str(data.get("txLocationName"))
+    if project and "txElevation" in data:
+        project_settings_payload["txElevation"] = _coerce_float(data.get("txElevation"))
+
     if project:
-        project_settings_payload = {
-            "propagationModel": current_user.propagation_model,
-            "Total_loss": current_user.total_loss,
-            "antennaGain": current_user.antenna_gain,
-            "rxGain": 0.0,
-            "transmissionPower": current_user.transmission_power,
-            "frequency": current_user.frequencia,
-            "towerHeight": current_user.tower_height,
-            "rxHeight": current_user.rx_height,
-            "antennaTilt": getattr(current_user, "antenna_tilt", None),
-            "antennaDirection": getattr(current_user, "antenna_direction", None),
-            "timePercentage": current_user.time_percentage,
-            "temperature": temperature_c,
-            "pressure": current_user.pressure_hpa,
-            "waterDensity": current_user.water_density,
-            "serviceType": current_user.servico,
-            "polarization": current_user.polarization,
-            "p452Version": current_user.p452_version,
-            "latitude": current_user.latitude,
-            "longitude": current_user.longitude,
-            "coverageEngine": coverage_engine,
-            "radius": _coerce_float(data.get('radius')) if 'radius' in data else None,
-            "minSignalLevel": _coerce_float(data.get('minSignalLevel')),
-            "maxSignalLevel": _coerce_float(data.get('maxSignalLevel')),
-        }
+        project_settings_payload["coverageEngine"] = coverage_engine
+        project_settings_payload["lastSavedAt"] = datetime.utcnow().isoformat()
+        if 'radius' in data:
+            radius_value = _coerce_float(data.get('radius'))
+            if radius_value is not None:
+                project_settings_payload['radius'] = radius_value
+        if 'minSignalLevel' in data:
+            value = _coerce_float(data.get('minSignalLevel'))
+            if value is not None:
+                project_settings_payload['minSignalLevel'] = value
+        if 'maxSignalLevel' in data:
+            value = _coerce_float(data.get('maxSignalLevel'))
+            if value is not None:
+                project_settings_payload['maxSignalLevel'] = value
         if coverage_engine == CoverageEngine.rt3d.value:
             rt3d_numeric_fields = (
                 "rt3dUrbanRadius",
@@ -973,13 +1124,14 @@ def salvar_dados():
                 source_value = _coerce_str(data.get("rt3dBuildingSource"))
                 if source_value:
                     project_settings_payload["rt3dBuildingSource"] = source_value
-        base_settings = project.settings or {}
-        updated_settings = dict(base_settings)
-        for key, value in project_settings_payload.items():
-            if value is not None:
-                updated_settings[key] = value
-        updated_settings["lastSavedAt"] = datetime.utcnow().isoformat()
-        project.settings = updated_settings
+        if project_settings_payload.get("temperature") is None and user_temperature_c is not None:
+            project_settings_payload["temperature"] = user_temperature_c
+        project.settings = project_settings_payload
+
+        # sincroniza receptores atuais com o banco e com os bookmarks
+        if 'receivers' in data:
+            incoming_receivers = data.get('receivers') if isinstance(data.get('receivers'), list) else []
+            _sync_project_receivers(project, incoming_receivers)
 
     # 5. Commit no banco
     try:
@@ -999,6 +1151,10 @@ def salvar_dados():
         }), 500
 
     # 6. Retornar snapshot atualizado
+    temperature_c = user_temperature_c
+    if temperature_c is None and "temperature" in data:
+        temperature_c = _coerce_float(data.get("temperature"))
+
     response_payload = {
         "status": "ok",
         "towerHeight": current_user.tower_height,
@@ -1505,6 +1661,25 @@ def home():
     # snapshot já contempla merge entre job e artifacts;
     # usamos o helper para não duplicar lógica com outras telas.
     coverage_snapshot = _latest_coverage_snapshot(selected_project) if selected_project else None
+    if selected_project and selected_project.settings:
+        # alinhar o snapshot (lastCoverage) ao último save de coordenadas
+        base_settings = dict(selected_project.settings or {})
+        tx_lat = base_settings.get('latitude')
+        tx_lon = base_settings.get('longitude')
+        tx_name = base_settings.get('txLocationName')
+        tx_elev = base_settings.get('txElevation')
+        if coverage_snapshot:
+            if tx_lat is not None and tx_lon is not None:
+                center = coverage_snapshot.get('center') or coverage_snapshot.get('tx_location') or {}
+                center = dict(center)
+                center['lat'] = tx_lat
+                center['lng'] = tx_lon
+                coverage_snapshot['center'] = center
+                coverage_snapshot['tx_location'] = center
+            if tx_name:
+                coverage_snapshot['tx_location_name'] = tx_name
+            if tx_elev is not None:
+                coverage_snapshot['tx_site_elevation'] = tx_elev
 
     def _value_from_sources(keys, user_attr=None):
         """Busca o primeiro valor válido considerando settings salvos,
@@ -3387,45 +3562,58 @@ def _compute_haat_radials(
 
 
 def _lookup_municipality_details(lat, lon, include_ibge=False):
-    params = {
-        'lat': lat,
-        'lon': lon,
-        'format': 'jsonv2',
-        'accept-language': 'pt-BR',
-    }
-    headers = {'User-Agent': 'ATXCoverage/1.0'}
     try:
-        resp = requests.get('https://nominatim.openstreetmap.org/reverse', params=params, timeout=15, headers=headers)
-        resp.raise_for_status()
-        data = resp.json()
-        address = data.get('address') or {}
-        city = address.get('city') or address.get('town') or address.get('village') or address.get('municipality')
-        if not city:
-            return None
-        state_label = address.get('state_code') or address.get('state')
-        detail = {
-            'name': city,
-            'state': address.get('state'),
-            'state_code': ibge_api.normalize_state_code(state_label),
-            'country': address.get('country'),
-            'provider': 'osm-nominatim',
-        }
-        if include_ibge:
-            state_hint = detail.get('state_code') or detail.get('state')
-            detail['ibge_code'] = ibge_api.resolve_municipality_code(detail['name'], state_hint)
-        return detail
-    except Exception as exc:
-        current_app.logger.warning('Geocoding provider osm-nominatim falhou: %s', exc)
+        detail = ibge_api.reverse_geocode_offline(lat, lon)
+    except ibge_api.ReverseGeocoderUnavailable as exc:
+        current_app.logger.warning('geocode.offline_unavailable', extra={'error': str(exc)})
         return None
+    if not detail or not detail.get('name'):
+        return None
+    response = {
+        'name': detail.get('name'),
+        'state': detail.get('state'),
+        'state_code': detail.get('state_code'),
+        'country': detail.get('country') or 'BR',
+        'provider': detail.get('provider') or 'reverse_geocoder',
+    }
+    code = None
+    population = None
+    population_year = None
+    if include_ibge:
+        state_hint = response.get('state_code') or response.get('state')
+        code = ibge_api.resolve_municipality_code(response.get('name'), state_hint)
+        if not code:
+            entry = ibge_api.find_local_municipality(response.get('name'), state_hint)
+            if entry:
+                code = entry.get('code')
+        if code:
+            entry = ibge_api.get_local_municipality_entry(code)
+            if entry:
+                response['name'] = entry.get('name') or response['name']
+                response['state'] = entry.get('state') or response['state']
+                response['state_code'] = entry.get('state_code') or response['state_code']
+                population = entry.get('population')
+                population_year = entry.get('population_year')
+            response['ibge_code'] = str(code)
+    response['population'] = population
+    response['population_year'] = population_year
+    return response
 
 
 def _lookup_municipality(lat, lon):
-    details = _lookup_municipality_details(lat, lon, include_ibge=False)
+    details = _lookup_municipality_details(lat, lon, include_ibge=True)
     if not details:
         return None
     parts = [details.get('name'), details.get('state'), details.get('country')]
     formatted = ', '.join(part for part in parts if part)
-    return formatted or None
+    return {
+        'label': formatted or None,
+        'ibge_code': details.get('ibge_code'),
+        'state': details.get('state'),
+        'state_code': details.get('state_code'),
+        'population': details.get('population'),
+        'population_year': details.get('population_year'),
+    }
 
 
 def _downsample_sequence(values, max_points=256):
@@ -5072,7 +5260,6 @@ def download_coverage_kml(slug):
         return jsonify({'error': 'Cobertura sem limites válidos para gerar KML.'}), 400
 
     overlay_bytes = _load_asset_bytes(snapshot.get('asset_id'), snapshot.get('asset_path'))
-    overlay_href = None
     if overlay_bytes:
         overlay_href = f"data:image/png;base64,{base64.b64encode(overlay_bytes).decode('ascii')}"
     else:
@@ -6254,6 +6441,10 @@ def calculate_coverage():
 @bp.route('/tx-location', methods=['POST'])
 @login_required
 def atualizar_localizacao_tx():
+    try:
+        db.session.rollback()
+    except Exception:
+        pass
     data = request.get_json() or {}
     try:
         lat = float(data.get('latitude'))
@@ -6266,6 +6457,7 @@ def atualizar_localizacao_tx():
     if project_slug:
         try:
             project = _load_project_for_current_user(project_slug)
+            _remember_active_project(project)
         except NotFound:
             project = None
 
@@ -6273,26 +6465,37 @@ def atualizar_localizacao_tx():
     if not user:
         return jsonify({'error': 'Usuário não encontrado.'}), 404
 
-    user.latitude = lat
-    user.longitude = lon
-
-    municipality = _lookup_municipality(lat, lon)
+    municipality_detail = _lookup_municipality(lat, lon)
+    municipality_label = None
+    if isinstance(municipality_detail, dict):
+        municipality_label = municipality_detail.get('label')
+    elif isinstance(municipality_detail, str):
+        municipality_label = municipality_detail
+    else:
+        municipality_label = None
     elevation = _compute_site_elevation(lat, lon)
-
-    if municipality:
-        user.tx_location_name = municipality
-    if elevation is not None:
-        user.tx_site_elevation = elevation
 
     if project:
         settings = dict(project.settings or {})
         settings['latitude'] = lat
         settings['longitude'] = lon
-        if municipality:
-            settings['txLocationName'] = municipality
+        if municipality_label:
+            settings['txLocationName'] = municipality_label
+            if isinstance(municipality_detail, dict):
+                settings['txMunicipality'] = municipality_detail.get('label')
+                settings['txIbgeCode'] = municipality_detail.get('ibge_code')
+                settings['txPopulation'] = municipality_detail.get('population')
+                settings['txPopulationYear'] = municipality_detail.get('population_year')
         if elevation is not None:
             settings['txElevation'] = elevation
         project.settings = settings
+    else:
+        user.latitude = lat
+        user.longitude = lon
+        if municipality_label:
+            user.tx_location_name = municipality_label
+        if elevation is not None:
+            user.tx_site_elevation = elevation
 
     try:
         if project:
@@ -6303,8 +6506,11 @@ def atualizar_localizacao_tx():
         return jsonify({'error': str(exc)}), 500
 
     return jsonify({
-        'municipality': user.tx_location_name,
-        'elevation': user.tx_site_elevation,
+        'municipality': municipality_label,
+        'ibge_code': (municipality_detail or {}).get('ibge_code') if isinstance(municipality_detail, dict) else None,
+        'population': (municipality_detail or {}).get('population') if isinstance(municipality_detail, dict) else None,
+        'population_year': (municipality_detail or {}).get('population_year') if isinstance(municipality_detail, dict) else None,
+        'elevation': elevation,
         'project': project.slug if project else None,
     }), 200
 
@@ -6364,11 +6570,36 @@ def clear_project_receivers(slug):
 @login_required
 def clima_recomendado():
     user = User.query.get(current_user.id)
-    if not user or user.latitude is None or user.longitude is None:
+    if not user:
+        return jsonify({'error': 'Usuário não encontrado.'}), 404
+
+    project_slug = request.args.get('project') or request.args.get('projectSlug')
+    lat = None
+    lon = None
+    if project_slug:
+        try:
+            project = _load_project_for_current_user(project_slug)
+        except Exception:
+            project = None
+        if project:
+            lat = _coerce_float((project.settings or {}).get('latitude'))
+            lon = _coerce_float((project.settings or {}).get('longitude'))
+            if lat is None or lon is None:
+                last_cov = _latest_coverage_snapshot(project)
+                center = (last_cov or {}).get('center') or (last_cov or {}).get('tx_location')
+                if center:
+                    lat = _coerce_float(center.get('lat') or center.get('latitude'))
+                    lon = _coerce_float(center.get('lng') or center.get('lon') or center.get('longitude'))
+
+    if lat is None or lon is None:
+        lat = _coerce_float(user.latitude)
+        lon = _coerce_float(user.longitude)
+
+    if lat is None or lon is None:
         return jsonify({'error': 'Latitude/longitude não definidos. Informe a posição da TX primeiro.'}), 400
 
-    lat = float(user.latitude)
-    lon = float(user.longitude)
+    lat = float(lat)
+    lon = float(lon)
     end_date = datetime.utcnow().date()
     start_date = end_date - timedelta(days=360)
 
@@ -6534,78 +6765,64 @@ def carregar_dados():
             return jsonify({'error': 'Usuário não encontrado.'}), 404
         project_slug = request.args.get('project')
         project = None
-        project_settings = {}
+        project_settings_view = {}
         if project_slug:
             project = _load_project_for_current_user(project_slug)
-            project_settings = _project_settings_with_dynamic(project)
+            project_settings_view = _project_settings_with_dynamic(project)
 
         latest_snapshot = _latest_coverage_snapshot(project) if project else None
 
-        user_data = {
-            'username': user.username,
-            'email': user.email,
-            'propagationModel': user.propagation_model,
-            'frequency': user.frequencia,
-            'towerHeight': user.tower_height,
-            'rxHeight': user.rx_height,
-            'Total_loss': user.total_loss,
-            'transmissionPower': user.transmission_power,
-            'antennaGain': user.antenna_gain,
-            'antennaTilt': user.antenna_tilt,
-            'antennaDirection': user.antenna_direction,
-            'rxGain': user.rx_gain,
-            'latitude': user.latitude,
-            'longitude': user.longitude,
-            'serviceType': user.servico,
-            'nomeUsuario': user.username,
-            'timePercentage': user.time_percentage or 40.0,
-            'polarization': (user.polarization or 'vertical').lower(),
-            'p452Version': user.p452_version or 16,
-            'temperature': (user.temperature_k - 273.15) if user.temperature_k else 20.0,
-            'pressure': user.pressure_hpa or 1013.0,
-            'waterDensity': user.water_density or 7.5,
-            'txLocationName': user.tx_location_name,
-            'txElevation': user.tx_site_elevation,
-            'climateUpdatedAt': user.climate_updated_at.isoformat() if user.climate_updated_at else None,
-            'climateLatitude': user.climate_lat,
-            'climateLongitude': user.climate_lon,
-            'coverageEngine': CoverageEngine.p1546.value,
-        }
-
-        for key, value in project_settings.items():
-            if value is not None:
-                user_data[key] = value
-
-        if latest_snapshot:
-            project_settings['lastCoverage'] = latest_snapshot
-            if latest_snapshot.get('engine'):
-                user_data['coverageEngine'] = latest_snapshot['engine']
-            center = latest_snapshot.get('center') or latest_snapshot.get('tx_location')
-            if center and user_data.get('latitude') is None:
-                user_data['latitude'] = center.get('lat')
-            if center and user_data.get('longitude') is None:
-                user_data['longitude'] = center.get('lng')
-            if latest_snapshot.get('tx_location_name') and not user_data.get('txLocationName'):
-                user_data['txLocationName'] = latest_snapshot['tx_location_name']
-            if latest_snapshot.get('tx_site_elevation') is not None and user_data.get('txElevation') is None:
-                user_data['txElevation'] = latest_snapshot['tx_site_elevation']
-
-        if project_settings:
-            user_data['coverageEngine'] = project_settings.get('coverageEngine', user_data['coverageEngine'])
-            user_data['projectSettings'] = project_settings
-        else:
-            user_data['projectSettings'] = {}
-
+        base_settings = {}
         if project:
+            base_settings = dict(project.settings or {})
+            is_new_project = not latest_snapshot and _is_project_settings_empty(base_settings)
+            user_data = _blank_project_payload(user, project)
+            user_data = _apply_project_settings(user_data, base_settings)
+            if latest_snapshot:
+                user_data['lastCoverage'] = latest_snapshot
+            user_data['projectSettings'] = project_settings_view
             user_data['projectSlug'] = project.slug
             user_data['projectName'] = project.name
             user_data['projectDescription'] = project.description
-            if project_settings.get('lastSavedAt'):
-                user_data['projectLastSavedAt'] = project_settings.get('lastSavedAt')
-            if latest_snapshot:
-                user_data['lastCoverage'] = latest_snapshot
+            user_data['projectLastSavedAt'] = base_settings.get('lastSavedAt')
+            if is_new_project:
+                user_data['lastCoverage'] = None
+        else:
+            user_data = {
+                'username': user.username,
+                'email': user.email,
+                'propagationModel': user.propagation_model,
+                'frequency': user.frequencia,
+                'towerHeight': user.tower_height,
+                'rxHeight': user.rx_height,
+                'Total_loss': user.total_loss,
+                'transmissionPower': user.transmission_power,
+                'antennaGain': user.antenna_gain,
+                'antennaTilt': user.antenna_tilt,
+                'antennaDirection': user.antenna_direction,
+                'rxGain': user.rx_gain,
+                'latitude': user.latitude,
+                'longitude': user.longitude,
+                'serviceType': user.servico,
+                'nomeUsuario': user.username,
+                'timePercentage': user.time_percentage or 40.0,
+                'polarization': (user.polarization or 'vertical').lower() if user.polarization else None,
+                'p452Version': user.p452_version or 16,
+                'temperature': (user.temperature_k - 273.15) if user.temperature_k else 20.0,
+                'pressure': user.pressure_hpa or 1013.0,
+                'waterDensity': user.water_density or 7.5,
+                'txLocationName': user.tx_location_name,
+                'txElevation': user.tx_site_elevation,
+                'climateUpdatedAt': user.climate_updated_at.isoformat() if user.climate_updated_at else None,
+                'climateLatitude': user.climate_lat,
+                'climateLongitude': user.climate_lon,
+                'coverageEngine': CoverageEngine.p1546.value,
+                'projectSettings': {},
+                'receiverBookmarks': [],
+            }
 
-        receiver_bookmarks = project_settings.get('receiverBookmarks') if isinstance(project_settings, dict) else None
+        source_settings = base_settings if project else project_settings_view
+        receiver_bookmarks = source_settings.get('receiverBookmarks') if isinstance(source_settings, dict) else None
         if isinstance(receiver_bookmarks, list):
             user_data['receiverBookmarks'] = receiver_bookmarks
         else:
@@ -6635,7 +6852,15 @@ def reverse_geocode():
         if lat is None or lon is None:
             return jsonify({'error': 'Parâmetros inválidos.'}), 400
         municipality = _lookup_municipality(lat, lon)
-        return jsonify({'municipality': municipality or '-'}), 200
+        if not municipality:
+            return jsonify({'municipality': '-'}), 200
+        return jsonify({
+            'municipality': municipality.get('label') or '-',
+            'ibge_code': municipality.get('ibge_code'),
+            'state': municipality.get('state'),
+            'population': municipality.get('population'),
+            'population_year': municipality.get('population_year'),
+        }), 200
     except Exception as exc:
         current_app.logger.warning('reverse_geocode.failed: %s', exc)
         return jsonify({'error': 'Não foi possível determinar o município.'}), 500

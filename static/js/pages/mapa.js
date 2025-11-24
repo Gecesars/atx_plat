@@ -277,12 +277,14 @@ function openRxLegend(entry) {
     }
     const summary = entry.summary || {};
     const municipalityLine = summary.municipality ? `<div>Município: ${summary.municipality}</div>` : '';
+    const populationLine = summary.population ? `<div>População: ${Number(summary.population).toLocaleString('pt-BR')} ${summary.population_year ? `(${summary.population_year})` : ''}</div>` : '';
     const content = `
         <div class="rx-legend">
             <strong>${entry.label || getRxLabel(index)}</strong>
             <div>Nível: ${summary.field || '-'}</div>
             <div>Altitude: ${summary.elevation || '-'}</div>
             ${municipalityLine}
+            ${populationLine}
         </div>
     `;
     state.rxInfoWindow.setContent(content);
@@ -1101,7 +1103,13 @@ function fetchMunicipality(latLng) {
             if (!response.ok) {
                 throw new Error(json.error || 'Falha ao buscar município.');
             }
-            return json.municipality || null;
+            return {
+                label: json.municipality || null,
+                ibge_code: json.ibge_code || null,
+                state: json.state || null,
+                population: json.population ?? null,
+                population_year: json.population_year ?? null,
+            };
         }))
         .catch(() => null);
 }
@@ -1900,7 +1908,9 @@ function computeReceiverSummary(position) {
         })
         .then((municipality) => {
             if (municipality) {
-                summary.municipality = municipality;
+                summary.municipality = municipality.label || municipality;
+                summary.population = municipality.population ?? null;
+                summary.population_year = municipality.population_year ?? null;
             }
             return summary;
         })
@@ -2732,9 +2742,8 @@ async function synchronizeProjectData(buttonEl) {
         updateTxSummary(state.txData);
         window.coverageProjectSlug = slug;
 
-        const receiverBookmarks = Array.isArray(data.receiverBookmarks)
-            ? data.receiverBookmarks
-            : (Array.isArray(projectSettings.receiverBookmarks) ? projectSettings.receiverBookmarks : []);
+        // receptores passam a ser somente os que estão no mapa; bookmarks antigos são substituídos
+        const receiverBookmarks = serializeReceivers();
         state.savedReceiverBookmarks = receiverBookmarks;
 
         state.coverageData = lastCoverage.project_slug || lastCoverage.asset_id
@@ -2772,7 +2781,23 @@ async function synchronizeProjectData(buttonEl) {
             renderRxList();
         }
 
-        showToast('Dados sincronizados com sucesso.');
+        // Salvar estado atual dos receptores no backend
+        const savePayload = {
+            projectSlug: slug,
+            receivers: serializeReceivers(),
+            txLocationName: state.txData?.txLocationName || null,
+            txElevation: state.txData?.txElevation || null,
+            latitude: state.txData?.latitude,
+            longitude: state.txData?.longitude,
+            coverageEngine: state.txData?.coverageEngine,
+        };
+        await fetch(`/salvar-dados?project=${encodeURIComponent(slug)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(savePayload),
+        });
+
+        showToast('Dados salvos com sucesso.');
     } catch (error) {
         console.error('Erro ao sincronizar os dados do projeto', error);
         showToast('Não foi possível sincronizar os dados do projeto.', true);

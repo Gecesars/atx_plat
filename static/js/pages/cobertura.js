@@ -584,7 +584,11 @@
         statusEl.textContent = 'Consultando séries históricas (últimos 360 dias)...';
         button.disabled = true;
         try {
-            const response = await fetch('/clima-recomendado');
+            const params = new URLSearchParams();
+            if (state.projectSlug) {
+                params.set('project', state.projectSlug);
+            }
+            const response = await fetch(`/clima-recomendado${params.toString() ? `?${params.toString()}` : ''}`);
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
                 const message = errorData.error || 'Não foi possível carregar dados climáticos.';

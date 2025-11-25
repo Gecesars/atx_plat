@@ -25,6 +25,51 @@ def legacy_storage_root() -> Path | None:
     return path
 
 
+def _resolve_file_path(legacy_path: str) -> Path | None:
+    if not legacy_path or str(legacy_path).startswith('inline://'):
+        return None
+    
+    # Strip file:// prefix if present
+    clean_path = str(legacy_path)
+    if clean_path.startswith('file://'):
+        clean_path = clean_path[7:]
+        
+    root = legacy_storage_root()
+    if not root:
+        return None
+        
+    # Prevent directory traversal
+    try:
+        file_path = (root / clean_path).resolve()
+        if not str(file_path).startswith(str(root.resolve())):
+            return None
+    except Exception:
+        return None
+        
+    return file_path if file_path.exists() else None
+
+def read_asset_data(asset) -> bytes | None:
+    """
+    Reads asset data from DB or filesystem without modifying the asset.
+    """
+    if not asset:
+        return None
+    
+    # 1. Try DB data
+    if getattr(asset, 'data', None):
+        return bytes(asset.data)
+        
+    # 2. Try filesystem
+    legacy_path = getattr(asset, 'path', None)
+    file_path = _resolve_file_path(legacy_path)
+    if file_path:
+        try:
+            return file_path.read_bytes()
+        except OSError:
+            pass
+            
+    return None
+
 def rehydrate_asset_data(asset, *, kind: str = 'legacy') -> bytes | None:
     """
     Loads legacy data from the filesystem into the provided Asset row, storing it inline.
@@ -32,15 +77,13 @@ def rehydrate_asset_data(asset, *, kind: str = 'legacy') -> bytes | None:
     """
     if not asset or getattr(asset, 'data', None):
         return None
+        
     legacy_path = getattr(asset, 'path', None)
-    if not legacy_path or str(legacy_path).startswith('inline://'):
+    file_path = _resolve_file_path(legacy_path)
+    
+    if not file_path:
         return None
-    root = legacy_storage_root()
-    if not root:
-        return None
-    file_path = root / legacy_path
-    if not file_path.exists():
-        return None
+
     try:
         payload = file_path.read_bytes()
     except OSError:

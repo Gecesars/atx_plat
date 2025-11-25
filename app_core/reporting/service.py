@@ -362,6 +362,7 @@ def _estimate_population_impact(
     snapshot: Dict[str, Any],
     allow_remote_lookup: bool = True,
     receivers_preprocessed: list[Dict[str, Any]] | None = None,
+    service_type: str | None = None,
 ) -> tuple[list[Dict[str, Any]], int]:
     """
     Estima o impacto populacional filtrando receptores acima do limiar em dBµV/m.
@@ -371,10 +372,21 @@ def _estimate_population_impact(
     processed_receivers = receivers_preprocessed or _collect_receiver_entries(snapshot, limit=None)
     registry = snapshot.get('ibge_registry') or {}
 
+    # Determina limiar padrão baseado no serviço
+    default_threshold = 28.0
+    if service_type:
+        st = service_type.lower()
+        if 'tv' in st or 'televis' in st:
+            default_threshold = 41.0  # Limiar mais conservador para TV Digital
+
     try:
-        field_threshold_dbuv_m = float(str(snapshot.get('min_field_dbuv_m', 28.0)).replace(",", "."))
+        val = snapshot.get('min_field_dbuv_m')
+        if val is not None:
+            field_threshold_dbuv_m = float(str(val).replace(",", "."))
+        else:
+            field_threshold_dbuv_m = default_threshold
     except (TypeError, ValueError):
-        field_threshold_dbuv_m = 28.0
+        field_threshold_dbuv_m = default_threshold
 
     summary: list[Dict[str, Any]] = []
     total = 0
@@ -1016,9 +1028,22 @@ def _format_user_climate(user) -> str | None:
 def _build_metrics(project: Project, snapshot: Dict[str, Any], center_metrics: Dict[str, Any]) -> Dict[str, Any]:
     settings = project.settings or {}
     user = project.user
-    power_w = _safe_float(getattr(user, "transmission_power", None))
-    gain_dbi = _safe_float(getattr(user, "antenna_gain", None))
-    loss_db = _safe_float(getattr(user, "total_loss", None))
+    
+    # Helper to get value from settings or user
+    def _get_val(keys, user_attr, default=None):
+        if isinstance(keys, str):
+            keys = [keys]
+        for k in keys:
+            if k in settings and settings[k] is not None:
+                return settings[k]
+        return getattr(user, user_attr, default)
+
+    power_w = _safe_float(_get_val(['transmissionPower', 'transmission_power'], 'transmission_power'))
+    gain_dbi = _safe_float(_get_val(['antennaGain', 'antenna_gain'], 'antenna_gain'))
+    loss_db = _safe_float(_get_val(['Total_loss', 'total_loss'], 'total_loss'))
+    freq_mhz = _safe_float(_get_val(['frequency', 'frequencia'], 'frequencia'))
+    polarization = _get_val(['polarization'], 'polarization')
+    
     tx_power_dbm = None
     if power_w is not None:
         try:
@@ -1043,8 +1068,8 @@ def _build_metrics(project: Project, snapshot: Dict[str, Any], center_metrics: D
         "location": settings.get("tx_location_name") or snapshot.get("tx_location_name") or getattr(user, "tx_location_name", "—"),
         "erp_dbm": erp_dbm,
         "radius_km": snapshot.get("radius_km") or snapshot.get("requested_radius_km"),
-        "frequency_mhz": getattr(user, "frequencia", None),
-        "polarization": getattr(user, "polarization", None),
+        "frequency_mhz": freq_mhz,
+        "polarization": polarization,
         "horizontal_peak_to_peak_db": _horizontal_peak_to_peak_db(user),
         "climate": climate_text,
         "tx_power_w": power_w,
@@ -1649,9 +1674,9 @@ def generate_analysis_report(
     ]
     right_column = [
         ('Potência TX', _format_number(metrics.get('tx_power_w'), 'W')),
-        ('Ganho TX (dBd)', _format_number(_gain_dbi_to_dbd(getattr(user, 'antenna_gain', None)), 'dBd')),
+        ('Ganho TX (dBd)', _format_number(metrics.get('antenna_gain_dbd'), 'dBd')),
         ('Perdas Sistêmicas', _format_number(metrics.get('losses_db'), 'dB')),
-        ('Polarização', getattr(user, 'polarization', '—')),
+        ('Polarização', metrics.get('polarization') or '—'),
         ('Perda combinada', _format_number(center_metrics.get('combined_loss_center_db'), 'dB')),
         ('Ganho efetivo', _format_number(center_metrics.get('effective_gain_center_db'), 'dB')),
         ('L_b (centro)', _format_number((loss_components.get('L_b') or {}).get('center'), 'dB')),

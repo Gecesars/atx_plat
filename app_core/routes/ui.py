@@ -130,30 +130,28 @@ def _blank_project_payload(user: User, project: Project) -> dict:
         'receiverBookmarks': [],
         'lastCoverage': None,
         'projectLastSavedAt': None,
-        'txLocationName': None,
-        'txElevation': None,
-        'latitude': None,
-        'longitude': None,
-        'transmissionPower': None,
-        'frequency': None,
-        'towerHeight': None,
-        'rxHeight': None,
-        'Total_loss': None,
-        'antennaGain': None,
-        'rxGain': None,
-        'antennaTilt': None,
-        'antennaDirection': None,
-        'serviceType': None,
-        'propagationModel': None,
-        'polarization': None,
-        'timePercentage': 40.0,
-        'p452Version': 16,
-        'temperature': 20.0,
-        'pressure': 1013.0,
-        'waterDensity': 7.5,
+        'txLocationName': user.tx_location_name,
+        'txElevation': user.tx_site_elevation,
+        'latitude': user.latitude,
+        'longitude': user.longitude,
+        'transmissionPower': user.transmission_power,
+        'frequency': user.frequencia,
+        'towerHeight': user.tower_height,
+        'rxHeight': user.rx_height,
+        'Total_loss': user.total_loss,
+        'antennaGain': user.antenna_gain,
+        'rxGain': user.rx_gain,
+        'antennaTilt': user.antenna_tilt,
+        'antennaDirection': user.antenna_direction,
+        'serviceType': user.servico,
+        'propagationModel': user.propagation_model,
+        'polarization': (user.polarization or 'vertical').lower() if user.polarization else None,
+        'timePercentage': user.time_percentage or 40.0,
+        'p452Version': user.p452_version or 16,
+        'temperature': (user.temperature_k - 273.15) if user.temperature_k else 20.0,
+        'pressure': user.pressure_hpa or 1013.0,
+        'waterDensity': user.water_density or 7.5,
         'txData': {},
-        'txLocationName': None,
-        'txElevation': None,
         'txLocation': None,
     }
     return defaults
@@ -176,8 +174,8 @@ def _apply_project_settings(payload: dict, settings: dict | None) -> dict:
     if not payload or not settings:
         return payload
     for key in PROJECT_SETTING_FIELDS:
-        if settings.get(key) is not None:
-            payload[key] = settings.get(key)
+        if key in settings:
+            payload[key] = settings[key]
     tx_name = settings.get('txLocationName')
     if tx_name is not None:
         payload['txLocationName'] = tx_name
@@ -272,12 +270,13 @@ def _load_asset_bytes(asset_id: str | None = None, asset_path: str | None = None
         asset = Asset.query.filter_by(id=asset_id).first()
     elif asset_path and str(asset_path).startswith('inline://'):
         asset = Asset.query.filter_by(path=asset_path).first()
+    
     if asset:
-        if asset.data:
-            return bytes(asset.data)
-        payload = rehydrate_asset_data(asset)
-        if payload:
-            return payload
+        # Use read_asset_data to handle both DB and filesystem (including file:// paths)
+        # without forcing rehydration (which deletes the file).
+        from app_core.storage_utils import read_asset_data
+        return read_asset_data(asset)
+        
     return None
 
 
@@ -776,8 +775,48 @@ def parse_pat(text):
 # Funções Auxiliares
 # =========================
 
+def _save_diagram_to_project(project: Project, file, direction, tilt):
+    """Salva diagrama como Asset do projeto e atualiza settings."""
+    try:
+        file_content = file.read()
+        
+        # Remove existing pattern asset
+        existing = Asset.query.filter_by(
+            project_id=project.id,
+            type=AssetType.other
+        ).filter(Asset.meta['kind'].astext == 'antenna_pattern').first()
+        
+        if existing:
+            db.session.delete(existing)
+            
+        # Create new asset
+        asset = Asset(
+            project_id=project.id,
+            type=AssetType.other,
+            path=inline_asset_path('antenna', 'pat'),
+            mime_type='text/plain',
+            byte_size=len(file_content),
+            data=file_content,
+            meta={'kind': 'antenna_pattern', 'filename': file.filename}
+        )
+        db.session.add(asset)
+        
+        # Update settings
+        settings = dict(project.settings or {})
+        if direction is not None:
+            settings['antennaDirection'] = direction
+        if tilt is not None:
+            settings['antennaTilt'] = tilt
+        project.settings = settings
+        
+        db.session.commit()
+        return True, "Diagrama salvo no projeto com sucesso"
+    except Exception as e:
+        db.session.rollback()
+        return False, f"Erro ao salvar no projeto: {str(e)}"
+
 def salvar_diagrama_usuario(user, file, direction, tilt):
-    """Função auxiliar para salvar diagrama no usuário"""
+    """Função auxiliar para salvar diagrama no usuário (LEGADO)"""
     try:
         file_content = file.read()
         user.antenna_pattern = file_content
@@ -1020,10 +1059,9 @@ def salvar_dados():
     for incoming_key, model_attr in simple_float_fields.items():
         if incoming_key in data:
             value = _coerce_float(data.get(incoming_key))
-            if value is not None:
-                if incoming_key == "antennaGain":
-                    value = value + GAIN_OFFSET_DBI_DBD
-                _assign_value(incoming_key, model_attr, value)
+            # Se value for None, significa que o usuário limpou o campo.
+            # Devemos salvar None no projeto para que ele possa herdar o default (ou ficar vazio).
+            _assign_value(incoming_key, model_attr, value)
 
     # Ganho de receptor fixo em 0 dBi para estudos ponto-área
     _assign_value("rxGain", "rx_gain", 0.0)
@@ -2059,16 +2097,45 @@ def home():
 @bp.route('/carregar_imgs', methods=['GET'])
 @login_required
 def carregar_imgs():
-    user_id = current_user.id
-    user = User.query.get(user_id)
+    project_slug = request.args.get('project')
+    project = None
+    if project_slug:
+        project = _load_project_for_current_user(project_slug)
 
-    direction = user.antenna_direction
-    tilt      = user.antenna_tilt
+    # Fallback to user if no project (legacy behavior) or if project has no pattern
+    # But ideally we want to enforce project context.
+    # Let's check if project has an antenna pattern asset.
+    
+    file_content = None
+    direction = None
+    tilt = None
+    
+    if project:
+        # Check for antenna pattern asset
+        asset = Asset.query.filter_by(
+            project_id=project.id,
+            type=AssetType.other
+        ).filter(Asset.meta['kind'].astext == 'antenna_pattern').first()
+        
+        if asset:
+            file_content = _asset_bytes(asset)
+            if file_content:
+                file_content = file_content.decode('latin1', errors='ignore')
+        
+        settings = project.settings or {}
+        direction = settings.get('antennaDirection')
+        tilt = settings.get('antennaTilt')
+    
+    if not file_content:
+        # Fallback to legacy user profile
+        user = current_user
+        direction = user.antenna_direction
+        tilt = user.antenna_tilt
+        if user.antenna_pattern:
+            file_content = user.antenna_pattern.decode('latin1', errors='ignore')
 
-    if not user.antenna_pattern:
+    if not file_content:
         return jsonify({'error': 'Nenhum diagrama salvo.'}), 404
-
-    file_content = user.antenna_pattern.decode('latin1', errors='ignore')
 
     # Parser universal
     horizontal_data, vertical_data, meta = parse_pat(file_content)
@@ -2077,16 +2144,16 @@ def carregar_imgs():
     if direction is not None:
         rotation_index = int(direction / (360 / len(horizontal_data)))
         rotated_data   = np.roll(horizontal_data, rotation_index)
-        horizontal_image_base64 = generate_dual_polar_plot(horizontal_data, rotated_data, direction)
+        horizontal_image_base64, _, _ = generate_dual_polar_plot(horizontal_data, rotated_data, direction)
     else:
-        horizontal_image_base64 = generate_polar_plot(horizontal_data)
+        horizontal_image_base64, _, _ = generate_polar_plot(horizontal_data)
 
     # Vertical: com/sem tilt
     angles = np.linspace(-90, 90, len(vertical_data), endpoint=True)
     if tilt is not None:
-        vertical_image_base64 = generate_dual_rectangular_plot(vertical_data, angles, tilt)
+        vertical_image_base64, _ = generate_dual_rectangular_plot(vertical_data, angles, tilt)
     else:
-        vertical_image_base64 = generate_rectangular_plot(vertical_data)
+        vertical_image_base64, _ = generate_rectangular_plot(vertical_data)
 
     return jsonify({
         'fileContent': file_content,
@@ -2106,6 +2173,7 @@ def salvar_diagrama():
 
     direction = request.form.get('direction')
     tilt      = request.form.get('tilt')
+    project_slug = request.form.get('project') or request.args.get('project')
 
     try:
         direction = float(direction) if direction and direction.strip() != '' else None
@@ -2116,48 +2184,58 @@ def salvar_diagrama():
     except ValueError:
         tilt = None
 
-    user_id = current_user.id
-    user = User.query.get(user_id)
-    if user:
-        success, message = salvar_diagrama_usuario(user, file, direction, tilt)
-        if success:
-            return jsonify({'message': 'File and settings saved successfully'})
-        else:
-            return jsonify({'error': message}), 500
+    if project_slug:
+        project = _load_project_for_current_user(project_slug)
+        success, message = _save_diagram_to_project(project, file, direction, tilt)
     else:
-        return jsonify({'error': 'User not found'}), 404
+        # Legacy fallback
+        user = current_user
+        success, message = salvar_diagrama_usuario(user, file, direction, tilt)
+
+    if success:
+        return jsonify({'message': 'File and settings saved successfully'})
+    else:
+        return jsonify({'error': message}), 500
+
 
 @bp.route('/upload_diagrama', methods=['POST'])
 @login_required
 def gerardiagramas():
     tilt = request.form.get('tilt', type=float)
     direction = request.form.get('direction', type=float)
+    project_slug = request.form.get('project') or request.args.get('project')
     file = request.files.get('file')
+    
     if not file:
         return jsonify({'error': 'No file provided'}), 400
 
-    # salva no banco usando função auxiliar
-    success, message = salvar_diagrama_usuario(current_user, file, direction, tilt)
+    # Save logic
+    if project_slug:
+        project = _load_project_for_current_user(project_slug)
+        success, message = _save_diagram_to_project(project, file, direction, tilt)
+    else:
+        success, message = salvar_diagrama_usuario(current_user, file, direction, tilt)
+        
     if not success:
         return jsonify({'error': message}), 500
 
-    # lê para parse - resetar o ponteiro do arquivo
+    # Read back for preview
     file.seek(0)
     file_content = file.read().decode('latin1', errors='ignore')
     horizontal_data, vertical_data, meta = parse_pat(file_content)
 
     if direction is None:
-        horizontal_image_base64 = generate_polar_plot(horizontal_data)
+        horizontal_image_base64, _, _ = generate_polar_plot(horizontal_data)
     else:
         rotation_index = int(direction / (360 / len(horizontal_data)))
         rotated_data   = np.roll(horizontal_data, rotation_index)
-        horizontal_image_base64 = generate_dual_polar_plot(horizontal_data, rotated_data, direction)
+        horizontal_image_base64, _, _ = generate_dual_polar_plot(horizontal_data, rotated_data, direction)
 
     angles_v = np.linspace(-90, 90, len(vertical_data), endpoint=True)
     if tilt is None:
-        vertical_image_base64 = generate_rectangular_plot(vertical_data)
+        vertical_image_base64, _ = generate_rectangular_plot(vertical_data)
     else:
-        vertical_image_base64 = generate_dual_rectangular_plot(vertical_data, angles_v, tilt)
+        vertical_image_base64, _ = generate_dual_rectangular_plot(vertical_data, angles_v, tilt)
 
     return jsonify({
         'horizontal_image_base64': horizontal_image_base64,
@@ -2196,8 +2274,7 @@ def generate_polar_plot(data):
 
     directivity_dB = calculate_directivity(data, 'h')
     data_table = [{"azimuth": f"{np.degrees(a):.1f}°", "gain": f"{g:.3f}"} for a, g in zip(azimutes, data)]
-    current_user.antenna_pattern_data_h = json.dumps(data_table)
-    db.session.commit()
+    
     ax.text(0.97, 0.87, f'Directivity: {directivity_dB:.2f} dB', transform=ax.transAxes,
             ha='left', va='top', bbox=dict(facecolor='white', alpha=0.8))
 
@@ -2210,13 +2287,12 @@ def generate_polar_plot(data):
     img_buffer = io.BytesIO()
     plt.savefig(img_buffer, format='png', bbox_inches='tight')
     img_buffer.seek(0)
-    current_user.antenna_pattern_img_dia_H = img_buffer.getvalue()
-    db.session.commit()
-    img_buffer.seek(0)
-    img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+    img_bytes = img_buffer.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
     img_buffer.close()
     plt.close(fig)
-    return img_base64
+    
+    return img_base64, json.dumps(data_table), img_bytes
 
 def generate_dual_polar_plot(original_data, rotated_data, direction):
     azimutes = np.linspace(0, 2 * np.pi, len(original_data))
@@ -2252,9 +2328,7 @@ def generate_dual_polar_plot(original_data, rotated_data, direction):
             ha='left', va='top', bbox=dict(facecolor='white', alpha=0.8))
 
     data_table = [{"azimuth": f"{np.degrees(a):.1f}°", "gain": f"{g:.3f}"} for a, g in zip(azimutes, rotated_data)]
-    current_user.antenna_pattern_data_h_modified = json.dumps(data_table)
-    db.session.commit()
-
+    
     ax.set_theta_zero_location('N')
     ax.set_theta_direction(-1)
     ax.set_title('Antenna Horizontal Radiation Pattern')
@@ -2265,12 +2339,12 @@ def generate_dual_polar_plot(original_data, rotated_data, direction):
     img_buffer = io.BytesIO()
     plt.savefig(img_buffer, format='png', bbox_inches='tight')
     img_buffer.seek(0)
-    current_user.antenna_pattern_img_dia_H = img_buffer.getvalue()
-    db.session.commit()
-    img_base64 = base64.b64encode(img_buffer.getvalue()).decode('utf-8')
+    img_bytes = img_buffer.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
     img_buffer.close()
     plt.close()
-    return img_base64
+    
+    return img_base64, json.dumps(data_table), img_bytes
 
 # --- util para HPBW em campo ---
 def _hpbw_from_field(angles_deg, field_norm):
@@ -2350,12 +2424,10 @@ def generate_rectangular_plot(vert_lin):
     plt.savefig(buffer, format='png', bbox_inches='tight')
     plt.close()
     buffer.seek(0)
-    current_user.antenna_pattern_img_dia_V = buffer.getvalue()
-    db.session.commit()
-    buffer.seek(0)
-    img_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    img_bytes = buffer.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
     buffer.close()
-    return img_base64
+    return img_base64, img_bytes
 
 def generate_dual_rectangular_plot(original_vert_lin, angles, tilt=None):
     base = np.asarray(original_vert_lin, float)
@@ -2408,12 +2480,10 @@ def generate_dual_rectangular_plot(original_vert_lin, angles, tilt=None):
     plt.savefig(buffer, format='png', bbox_inches='tight')
     plt.close()
     buffer.seek(0)
-    current_user.antenna_pattern_img_dia_V = buffer.getvalue()
-    db.session.commit()
-    buffer.seek(0)
-    img_base64 = base64.b64encode(buffer.read()).decode('utf-8')
+    img_bytes = buffer.getvalue()
+    img_base64 = base64.b64encode(img_bytes).decode('utf-8')
     buffer.close()
-    return img_base64
+    return img_base64, img_bytes
 
 # -------- Diretividade --------
 
@@ -6574,23 +6644,33 @@ def clima_recomendado():
         return jsonify({'error': 'Usuário não encontrado.'}), 404
 
     project_slug = request.args.get('project') or request.args.get('projectSlug')
-    lat = None
-    lon = None
+    
+    # 1. Tenta pegar da URL (prioridade para o que está na tela)
+    lat_arg = request.args.get('latitude') or request.args.get('lat')
+    lon_arg = request.args.get('longitude') or request.args.get('lon')
+    
+    lat = _coerce_float(lat_arg)
+    lon = _coerce_float(lon_arg)
+
+    project = None
     if project_slug:
         try:
             project = _load_project_for_current_user(project_slug)
         except Exception:
             project = None
-        if project:
-            lat = _coerce_float((project.settings or {}).get('latitude'))
-            lon = _coerce_float((project.settings or {}).get('longitude'))
-            if lat is None or lon is None:
-                last_cov = _latest_coverage_snapshot(project)
-                center = (last_cov or {}).get('center') or (last_cov or {}).get('tx_location')
-                if center:
-                    lat = _coerce_float(center.get('lat') or center.get('latitude'))
-                    lon = _coerce_float(center.get('lng') or center.get('lon') or center.get('longitude'))
 
+    # 2. Se não veio na URL, tenta do projeto
+    if (lat is None or lon is None) and project:
+        lat = _coerce_float((project.settings or {}).get('latitude'))
+        lon = _coerce_float((project.settings or {}).get('longitude'))
+        if lat is None or lon is None:
+            last_cov = _latest_coverage_snapshot(project)
+            center = (last_cov or {}).get('center') or (last_cov or {}).get('tx_location')
+            if center:
+                lat = _coerce_float(center.get('lat') or center.get('latitude'))
+                lon = _coerce_float(center.get('lng') or center.get('lon') or center.get('longitude'))
+
+    # 3. Fallback para usuário
     if lat is None or lon is None:
         lat = _coerce_float(user.latitude)
         lon = _coerce_float(user.longitude)
@@ -6659,12 +6739,28 @@ def clima_recomendado():
         actual_vapor_pressure = (rh / 100.0) * saturation_vapor_pressure
         absolute_humidity = 216.7 * (actual_vapor_pressure / (temp_c + 273.15))
 
-    user.temperature_k = temp_c + 273.15
-    user.pressure_hpa = avg_pressure
-    user.water_density = absolute_humidity
-    user.climate_lat = lat
-    user.climate_lon = lon
-    user.climate_updated_at = datetime.utcnow()
+    # Save to Project if active, else User (legacy)
+    climate_updated_at = datetime.utcnow()
+    
+    if project:
+        settings = dict(project.settings or {})
+        settings['temperature'] = temp_c
+        settings['pressure'] = avg_pressure
+        settings['waterDensity'] = absolute_humidity
+        settings['climateLat'] = lat
+        settings['climateLon'] = lon
+        settings['climateUpdatedAt'] = climate_updated_at.isoformat()
+        project.settings = settings
+        db.session.add(project)
+    else:
+        user.temperature_k = temp_c + 273.15
+        user.pressure_hpa = avg_pressure
+        user.water_density = absolute_humidity
+        user.climate_lat = lat
+        user.climate_lon = lon
+        user.climate_updated_at = climate_updated_at
+        db.session.add(user)
+        
     db.session.commit()
 
     return jsonify({
@@ -6673,14 +6769,83 @@ def clima_recomendado():
         'relativeHumidity': round(rh, 1),
         'waterDensity': round(max(0.0, absolute_humidity), 2),
         'daysSampled': len(temps),
-        'municipality': user.tx_location_name,
-        'climateUpdatedAt': user.climate_updated_at.isoformat() if user.climate_updated_at else None,
+        'municipality': (project.settings.get('txLocationName') if project and project.settings else user.tx_location_name),
+        'climateUpdatedAt': climate_updated_at.isoformat(),
     })
 
 @bp.route('/visualizar-dados-salvos')
 @login_required
 def visualizar_dados_salvos():
-    dados_salvos = current_user
+    # 1. Carrega usuário base
+    user = current_user
+    
+    # 2. Tenta carregar projeto ativo se solicitado
+    project_slug = request.args.get('project')
+    project = None
+    if project_slug:
+        try:
+            project = _load_project_for_current_user(project_slug)
+        except Exception:
+            project = None
+
+    # 3. Monta objeto de exibição (prioridade: Projeto > Usuário)
+    # Usamos um SimpleNamespace ou dict para emular o acesso por atributo do template
+    from types import SimpleNamespace
+    
+    # Começa com os dados do usuário
+    display_data = {
+        'username': user.username,
+        'email': user.email,
+        'servico': user.servico,
+        'propagation_model': user.propagation_model,
+        'frequencia': user.frequencia,
+        'transmission_power': user.transmission_power,
+        'antenna_gain': user.antenna_gain,
+        'total_loss': user.total_loss,
+        'tx_site_elevation': user.tx_site_elevation,
+        'latitude': user.latitude,
+        'longitude': user.longitude,
+        'polarization': user.polarization,
+        'notes': user.notes,
+        # Artefatos legados
+        'perfil_img': user.perfil_img,
+        'cobertura_img': user.cobertura_img,
+        'antenna_pattern_img_dia_H': user.antenna_pattern_img_dia_H,
+        'antenna_pattern_img_dia_V': user.antenna_pattern_img_dia_V,
+        'projects': user.projects, # Query object
+    }
+    
+    # Se tiver projeto, sobrescreve com settings
+    if project:
+        settings = project.settings or {}
+        
+        # Mapeamento de campos do settings para campos de exibição
+        # settings key -> display key
+        mapping = {
+            'serviceType': 'servico',
+            'propagationModel': 'propagation_model',
+            'frequency': 'frequencia',
+            'transmissionPower': 'transmission_power',
+            'antennaGain': 'antenna_gain',
+            'Total_loss': 'total_loss',
+            'txElevation': 'tx_site_elevation',
+            'latitude': 'latitude',
+            'longitude': 'longitude',
+            'polarization': 'polarization',
+        }
+        
+        for set_key, disp_key in mapping.items():
+            if set_key in settings and settings[set_key] is not None:
+                display_data[disp_key] = settings[set_key]
+                
+        # Campos especiais
+        if 'txLocationName' in settings:
+            # Se quiser exibir nome do local, pode adicionar ao template depois
+            pass
+
+    # Converte para objeto para acesso via .atributo no template
+    dados_salvos = SimpleNamespace(**display_data)
+
     image_data = {
         'perfil_img': base64.b64encode(dados_salvos.perfil_img).decode('utf-8') if dados_salvos.perfil_img else None,
         'cobertura_img': base64.b64encode(dados_salvos.cobertura_img).decode('utf-8') if dados_salvos.cobertura_img else None,
@@ -6690,32 +6855,31 @@ def visualizar_dados_salvos():
 
     coverage_cards = []
     try:
-        projects = dados_salvos.projects.order_by(Project.created_at.desc()).all()
+        # Se projects for query object
+        projects_list = dados_salvos.projects.order_by(Project.created_at.desc()).all()
     except Exception:
-        projects = []
+        projects_list = []
 
-    requested_slug = request.args.get('project') # Get the project slug from the request
-
-    for project in projects:
-        if requested_slug and project.slug != requested_slug:
+    for proj in projects_list:
+        if project_slug and proj.slug != project_slug:
             continue
 
-        snapshot = _latest_coverage_snapshot(project)
+        snapshot = _latest_coverage_snapshot(proj)
         asset_id = snapshot.get('asset_id') if snapshot else None
         if snapshot and asset_id:
             try:
-                preview_url = url_for('projects.asset_preview', slug=project.slug, asset_id=asset_id)
+                preview_url = url_for('projects.asset_preview', slug=proj.slug, asset_id=asset_id)
             except Exception:
                 preview_url = None
             if preview_url:
                 coverage_cards.append({
-                    'project': project,
+                    'project': proj,
                     'engine': snapshot.get('engine'),
                     'generated_at': snapshot.get('generated_at'),
                     'radius_km': snapshot.get('radius_km') or snapshot.get('requested_radius_km'),
                     'center_metrics': snapshot.get('center_metrics'),
                     'preview_url': preview_url,
-                    'detail_url': url_for('projects.view_project', slug=project.slug),
+                    'detail_url': url_for('projects.view_project', slug=proj.slug),
                 })
 
     return render_template('dados_salvos.html', dados_salvos=dados_salvos, image_data=image_data, coverage_cards=coverage_cards)
@@ -6828,9 +6992,11 @@ def carregar_dados():
         else:
             user_data['receiverBookmarks'] = []
 
-        if user_data.get('antennaGain') is not None:
-            converted_gain = _gain_dbi_to_dbd(user_data['antennaGain'])
-            user_data['antennaGain'] = converted_gain if converted_gain is not None else user_data['antennaGain']
+        # O front já faz a conversão dBi -> dBd para exibição.
+        # Não devemos converter aqui, senão ocorre dupla subtração.
+        # if user_data.get('antennaGain') is not None:
+        #     converted_gain = _gain_dbi_to_dbd(user_data['antennaGain'])
+        #     user_data['antennaGain'] = converted_gain if converted_gain is not None else user_data['antennaGain']
 
         return jsonify(user_data), 200
     except Exception as e:

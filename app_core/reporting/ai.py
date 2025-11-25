@@ -35,10 +35,15 @@ Responda EXCLUSIVAMENTE em JSON válido no formato:
   ]
 }}
 
+Restrições Negativas (CRÍTICO):
+- NÃO mencione "Petrolina" ou "Pernambuco" a menos que "Petrolina" esteja explicitamente escrito no campo "Região" abaixo.
+- NÃO invente cidades ou estados. Use apenas o que está em "Região".
+- NÃO use dados de exemplos de treinamento.
+
 Contexto:
 - Projeto: {project_name} ({project_slug})
 - Serviço: {service} / Classe {service_class}
-- Região: {location}
+- Região: {location} (Esta é a localização OFICIAL do projeto. Ignore qualquer outra menção geográfica que contradiga isso.)
 - Engine: {engine}
 - Clima: {climate}
 - Notas do projeto: {project_notes}
@@ -48,6 +53,7 @@ Contexto:
 {link_summary}
 - Receptores detalhados (JSON):
 {link_payload}
+  * Nota: O campo 'erp_dbm' em cada receptor representa a ERP DIRECIONAL (na direção daquele receptor), considerando o diagrama de irradiação da antena. É esperado que seja diferente da ERP máxima se a antena for direcional.
 - Potência do Transmissor (Entrada): {tx_power_w} W
 - Ganho da Antena (Entrada): {antenna_gain_dbd} dBd (equivalente a {antenna_gain_dbi} dBi)
 - Perdas (Entrada): {losses_db} dB
@@ -58,19 +64,19 @@ Parâmetros principais:
 - Polarização: {polarization}
 
 Requisitos:
-- overview: Inicie a string OBRIGATORIAME com o histórico de cálculo da ERP, formatado exatamente assim (substitua X, Y, Z, A, B pelos valores calculados com precisão):
-  "Cálculo ERP: [P_tx: 10*log10({tx_power_w}) = X dBW] + [G_ant: {antenna_gain_dbd} dBd (={antenna_gain_dbi} dBi)] - [Perdas: {losses_db} dB] = [ERP: Z dBW / A dBm / B kW]."
-  Este valor "A" (em dBm) é a ERP de referência.
-  Após o cálculo, insira um caractere de nova linha (use `\n`) e continue com o resumo executivo (até 7 frases) usando a ERP calculada.
+- overview: Inicie a string OBRIGATORIAME com o histórico de cálculo da ERP MÁXIMA, formatado exatamente assim (substitua X, Y, Z, A, B pelos valores calculados com precisão):
+  "Cálculo ERP Máxima: [P_tx: 10*log10({tx_power_w}) = X dBW] + [G_ant: {antenna_gain_dbd} dBd (={antenna_gain_dbi} dBi)] - [Perdas: {losses_db} dB] = [ERP Máx: Z dBW / A dBm / B kW]."
+  Este valor "A" (em dBm) é a ERP máxima de referência.
+  Após o cálculo, insira um caractere de nova linha (use `\\n`) e continue com o resumo executivo (até 7 frases) usando a ERP calculada.
 - coverage: Análise da mancha/cobertura, validando a cobertura contra a ERP calculada (Z dBW) e o {radius_km}.
-- profile: Análise do perfil de enlace. A ERP 'A' (em dBm) calculada no 'overview' é a única fonte de verdade. Se a imagem ou texto do perfil (ex: 'ERP na direção') mostrar um valor de ERP diferente, aponte isso como uma *inconsistência* nos dados de simulação.
+- profile: Análise do perfil de enlace.
 - pattern_horizontal: Análise da imagem do diagrama horizontal. Utilize sempre o valor pico a pico ({horizontal_peak_to_peak_db} dB) para classificar (ex.: <6 dB = omni, 6–12 dB = quasi‑omni, >12 dB = direcional). Se a imagem contrariar o valor, explique a divergência. Comente se esta direcionalidade está alinhada às {project_notes}.
 - pattern_vertical: comentários sobre tilt/elevação/ nulos e lobulos.
 - recommendations: lista com, no mínimo, 3 recomendações objetivas.
 - conclusion: parecer final considerando as notas do projeto, a ERP calculada (Z dBW / A dBm), e a direcionalidade (conforme 'pattern_horizontal').
 - link_analyses: para cada receptor listado no JSON {link_payload} (mesmo se faltarem dados):
   1. Forneça uma análise específica (distância, campo, potência).
-  2. Verifique se os níveis de sinal são coerentes com a ERP 'A' (em dBm) calculada.
+  2. Verifique se os níveis de sinal são coerentes com a ERP DIRECIONAL para aquele receptor (campo 'erp_dbm' no JSON do receptor). NÃO compare com a ERP máxima do sistema, pois a antena pode atenuar o sinal naquela direção.
   3. **Crucial:** Compare o campo/potência do receptor (listado em {link_payload}) com qualquer valor de campo/potência estimado na análise do 'profile' (se disponível para esse receptor) e aponte explicitamente qualquer discrepância (ex: "Campo no perfil é 70.8 dBµV/m, mas no receptor é 63.3 dBµV/m").
 - Utilize 25 dBµV/m como limiar mínimo de cobertura aceitável; destaque quando um receptor ficar abaixo desse valor e proponha correção.
 - Caso não haja perfil/imagem para um receptor, explicite "Dados indisponíveis" mas mantenha a entrada no array.

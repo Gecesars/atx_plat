@@ -36,9 +36,17 @@
         }
     }
 
+    function getProjectSlug() {
+        // Tenta pegar do URL query param 'project'
+        const params = new URLSearchParams(window.location.search);
+        return params.get('project') || '';
+    }
+
     async function loadExistingDiagrams() {
         try {
-            const response = await fetch('/carregar_imgs');
+            const project = getProjectSlug();
+            const url = project ? `/carregar_imgs?project=${encodeURIComponent(project)}` : '/carregar_imgs';
+            const response = await fetch(url);
             if (!response.ok) {
                 throw new Error('Não foi possível carregar os diagramas salvos.');
             }
@@ -75,6 +83,12 @@
 
         formData.append('direction', direction || '');
         formData.append('tilt', tilt || '');
+
+        const project = getProjectSlug();
+        if (project) {
+            formData.append('project', project);
+        }
+
         return formData;
     }
 
@@ -132,13 +146,13 @@
         </div>`;
         document.body.appendChild(toast);
         if (window.bootstrap && bootstrap.Toast) {
-        const bsToast = bootstrap.Toast.getOrCreateInstance(toast, { delay: 2600 });
-        bsToast.show();
-        toast.addEventListener('hidden.bs.toast', () => toast.remove());
-    } else {
-        alert(message);
-        toast.remove();
-    }
+            const bsToast = bootstrap.Toast.getOrCreateInstance(toast, { delay: 2600 });
+            bsToast.show();
+            toast.addEventListener('hidden.bs.toast', () => toast.remove());
+        } else {
+            alert(message);
+            toast.remove();
+        }
     }
 
     document.addEventListener('DOMContentLoaded', () => {

@@ -402,6 +402,7 @@
         const payload = {
             propagationModel: document.getElementById('propagationModel')?.value || null,
             serviceType: document.getElementById('serviceType')?.value || null,
+            txLocationName: document.getElementById('txLocationName')?.value || null,
             Total_loss: parseNumber(document.getElementById('Total_loss')?.value),
             timePercentage: parseNumber(document.getElementById('timePercentage')?.value),
             polarization: document.getElementById('polarization')?.value || null,
@@ -588,6 +589,17 @@
             if (state.projectSlug) {
                 params.set('project', state.projectSlug);
             }
+
+            // Parse current coordinates from the display field
+            const coordsField = document.getElementById('coordinates');
+            if (coordsField && coordsField.value) {
+                const match = coordsField.value.match(/Latitude:\s*([-\d.]+),\s*Longitude:\s*([-\d.]+)/);
+                if (match) {
+                    params.set('latitude', match[1]);
+                    params.set('longitude', match[2]);
+                }
+            }
+
             const response = await fetch(`/clima-recomendado${params.toString() ? `?${params.toString()}` : ''}`);
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({}));
@@ -630,7 +642,7 @@
         const latitude = marker.getPosition().lat().toFixed(6);
         const longitude = marker.getPosition().lng().toFixed(6);
         setCoordinatesText(latitude, longitude);
-        persistTxCoordinates(Number(latitude), Number(longitude)).catch(() => {});
+        persistTxCoordinates(Number(latitude), Number(longitude)).catch(() => { });
         modals.map?.hide();
     }
 
@@ -654,7 +666,7 @@
         const lonDecimal = (Math.abs(lonDegrees) + (lonMinutes / 60) + (lonSeconds / 3600)) * (lonDirection === 'W' ? -1 : 1);
 
         setCoordinatesText(latDecimal, lonDecimal);
-        persistTxCoordinates(latDecimal, lonDecimal).catch(() => {});
+        persistTxCoordinates(latDecimal, lonDecimal).catch(() => { });
         modals.coordinates?.hide();
     }
 

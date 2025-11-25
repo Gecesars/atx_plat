@@ -5,6 +5,9 @@ import math
 import statistics
 import time
 import uuid
+import os
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -147,12 +150,43 @@ def download_mapbiomas_tile(project, year):
         response = requests.get(url, stream=True)
         response.raise_for_status()
 
-        buffer = io.BytesIO()
-        for chunk in response.iter_content(chunk_size=8192):
-            if chunk:
-                buffer.write(chunk)
-        payload = buffer.getvalue()
-        file_size = len(payload)
+        # Stream to temp file to check size
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    tmp_file.write(chunk)
+            tmp_path = tmp_file.name
+
+        file_size = os.path.getsize(tmp_path)
+        MAX_DB_SIZE = 100 * 1024 * 1024  # 100 MB
+
+        asset_data = None
+        asset_path = inline_asset_path('lulc', 'tif')
+
+        if file_size > MAX_DB_SIZE:
+            # Offload to filesystem
+            storage_root = os.environ.get('STORAGE_ROOT') or os.environ.get('LEGACY_STORAGE_ROOT')
+            if not storage_root:
+                # Fallback relative to app root
+                storage_root = os.path.join(os.path.dirname(current_app.root_path), 'storage')
+            
+            blob_dir = os.path.join(storage_root, 'assets', 'large_blobs')
+            os.makedirs(blob_dir, exist_ok=True)
+            
+            blob_filename = f"{uuid.uuid4().hex}.tif"
+            dest_path = os.path.join(blob_dir, blob_filename)
+            shutil.move(tmp_path, dest_path)
+            
+            # Use a file:// URI relative to storage root or absolute
+            # We'll use a custom scheme or just store the relative path if the app handles it.
+            # For now, let's use a file URI that indicates it's in the storage root.
+            asset_path = f"file://assets/large_blobs/{blob_filename}"
+            current_app.logger.info(f"MapBiomas tile too large for DB ({file_size} bytes). Stored at {asset_path}")
+        else:
+            # Small enough for DB
+            with open(tmp_path, 'rb') as f:
+                asset_data = f.read()
+            os.remove(tmp_path)
 
         source = DatasetSource(
             project_id=project.id,
@@ -166,10 +200,10 @@ def download_mapbiomas_tile(project, year):
         asset = Asset(
             project_id=project.id,
             type=AssetType.lulc,
-            path=inline_asset_path('lulc', 'tif'),
+            path=asset_path,
             mime_type='image/tiff',
             byte_size=file_size,
-            data=payload,
+            data=asset_data,
             meta={'source': 'MapBiomas Collection 10', 'year': year},
             source_id=source.id
         )
@@ -181,6 +215,8 @@ def download_mapbiomas_tile(project, year):
 
     except requests.exceptions.RequestException as e:
         current_app.logger.error(f"Failed to download MapBiomas tile: {e}")
+        if 'tmp_path' in locals() and os.path.exists(tmp_path):
+            os.remove(tmp_path)
         db.session.rollback()
         return None
 
